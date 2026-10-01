@@ -9,7 +9,10 @@ working example over a complete product. Follow the scope and milestones in
 ## Keep it small
 
 - Keep all agent implementation in `pieni.py`, with a Bash launcher named `pieni`.
-- Use the Python standard library and only one external dependency: `openai`.
+- Use the Python standard library and only two direct external dependencies:
+  `openai` and `openrouter`, listed in `requirements.txt`.
+- Use `openai` for OpenAI Responses and DeepSeek/custom Chat Completions;
+  use the `openrouter` SDK for OpenRouter. Keep provider handling thin.
 - Use `configparser` for INI settings: user file first, launch-directory file
   second, and explicit CLI arguments last. Keep configuration small.
 - Aim for about 750 lines of agent code. This is a guideline, not a reason to

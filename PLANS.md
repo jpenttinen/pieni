@@ -8,9 +8,9 @@ It should be useful to run and easy to understand, fork, and extend—not a
 production agent platform.
 
 All agent code belongs in `pieni.py`, aiming for about 750 readable lines.
-Use only the standard library and the `openai` dependency, listed in
-`requirements.txt`. Provide a small Bash launcher named `pieni`; tests live in
-separate Python files. No agent code is to be generated during this planning task.
+Use only the standard library and two direct external dependencies, `openai` and
+`openrouter`, listed in `requirements.txt` (`pip install -r requirements.txt`).
+Provide a small Bash launcher named `pieni`; tests live in separate Python files. No agent code is to be generated during this planning task.
 
 ## First version
 
@@ -71,9 +71,22 @@ separate Python files. No agent code is to be generated during this planning tas
 - Accept `openai`, `openrouter`, `deepseek`, or a custom base URL, with a model
   name supplied through CLI or configuration. Do not hard-code a model catalog
   or invent provider capabilities.
-- Use a thin adapter: plan for OpenAI Responses and Chat Completions for the
-  other endpoints, normalizing only the messages and tool calls needed here.
-  Verify the relevant API details against official documentation when implementing.
+- Keep a thin adapter with these provider-specific calls:
+  - OpenAI: `from openai import OpenAI`, initialize `OpenAI()` (reads
+    `OPENAI_API_KEY`), and call `client.responses.create(...)`.
+  - DeepSeek: use `OpenAI(api_key=os.environ.get("DEEPSEEK_API_KEY"),
+    base_url="https://api.deepseek.com")` and
+    `client.chat.completions.create(...)`; no separate DeepSeek dependency.
+  - OpenRouter: install `openrouter` (`pip install openrouter`), import
+    `OpenRouter` from `openrouter`, and manage the client with
+    `with OpenRouter(api_key=os.getenv("OPENROUTER_API_KEY")) as client:`.
+    Call `client.chat.send(model=model, messages=..., ...)` and read final text
+    from `response.choices[0].message.content`.
+  - Custom base URLs: use the `openai` SDK's Chat Completions API.
+- Normalize only the messages, tool calls/results, final text, and usage needed
+  by the shared loop; do not build a general provider framework. Verify each
+  SDK's tool-call/result schema against official documentation when implementing.
+  Keep model names configurable rather than hard-coding sample model IDs.
 - Named providers use `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, or `DEEPSEEK_API_KEY`.
   Custom endpoints use `OPENAI_API_KEY` if needed; do not require a key for a
   local endpoint that accepts unauthenticated requests.
@@ -136,6 +149,10 @@ These are reviewable steps, not separate subsystems or a large PR program.
 3. **Finish the example:** Bash launcher, dependency declaration, accurate README,
    and remaining failure-path tests. Optional live smoke tests with an explicitly
    selected provider/model; no paid calls in the default test run.
+
+Mock each provider's SDK call, including OpenRouter client cleanup, tool-call
+continuation, usage extraction, and missing-key/provider errors. No live API
+requests in default tests.
 
 Test user/local/CLI configuration precedence, missing and malformed INI files,
 invalid settings, successful and failing tool calls, malformed arguments, DCG approval/denial,

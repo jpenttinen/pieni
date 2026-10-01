@@ -1,16 +1,17 @@
 # pieni
-A tiny AI agent written in Python. Despite being just one &lt;1000 lines file, it has minimal sandbox, destructive command guard (DCG), adapters for multiple LLM providers, context compacting and interactive mode + headless CLI. Despite being very small in size, it can do the coding for you and access the net.
+A tiny AI agent written in Python. Despite being just one &lt;1000 lines file, it has minimal sandbox, destructive command guard (DCG), adapters for multiple LLM providers, context compacting and interactive mode + headless CLI. Despite being very small in size, it can do the coding for you and access the net. You can easily fork and extend it.
 
-Pieni is perfect way to learn how AI agents work and you can fork and use it how you want.
+Pieni is perfect way to learn how AI agents work and you can fork and use it how you want. The word "pieni" is Finnish and means "small". 
 
-It supports the following providers:
-OpenAI
-OpenRouter
-Deepseek
+It supports the following providers (parentheses display, which API keys you should set as environment variable)
+OpenAI (OPENAI_API_KEY)
+OpenRouter (OPENROUTER_API_KEY)
+Deepseek (DEEPSEEK_API_KEY)
 Custom base URL, including local models e.g. llama-server / llama.cpp, ollama, LM studio, slang, vLLM
 
 ## CLI usage:
 pieni provider -m "model name" # start agent with provider and mode name
+pieni provider -m "model name" -s "API secret key" # It is highly recommended to use environment variable to store the API keys
 pieni deepseek -m "deepseek-flash"
 pieni openai -m "gpt-6-luna"
 pieni openrouter -m "glm-5.3-flash"

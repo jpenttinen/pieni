@@ -4,6 +4,8 @@
 The file holds everything: configuration, four tools, permissions, SQLite
 persistence, and the loop that calls a model until it stops requesting tools.
 See PLANS.md for the intended scope and AGENTS.md for the development rules.
+
+Written by Petri Kuittinen 2026.
 """
 
 import argparse
@@ -17,6 +19,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,11 +37,17 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 CONTEXT_WINDOW = 1_000_000  # display-only assumption, not a model's real limit
 CHARS_PER_TOKEN = 4         # crude estimate used only when usage is unavailable
-MAX_OUTPUT_CHARS = 20_000   # bound on tool output handed back to the model
-MAX_READ_LINES = 400
+MAX_OUTPUT_CHARS = 65_536  # bound on tool output handed back to the model
+MAX_READ_LINES = 5_000
 BASH_TIMEOUT = 60
-MAX_STEPS = 25              # tool rounds per task before Pieni gives up
+# Model rounds per task before Pieni gives up. One round can carry several tool
+# calls, so this is a round budget, not a hard count of individual tool calls.
+MAX_STEPS = 500
+THINK_TRACE_CHARACTERS = 120  # how much of a model thinking trace to display
+THINK_DOT_INTERVAL = 1.0      # print one "." this often while waiting for the model
 PROMPT = "pieni> "
+VERSION = "0.12"
+BANNER = f"Pieni agent v{VERSION} by Petri Kuittinen"
 
 SYSTEM_PROMPT = """You are Pieni, a small coding agent working in a local workspace.
 Use the tools to inspect and change files instead of guessing.
@@ -59,6 +68,20 @@ HELP = """commands:
 
 auto runs shell commands unless the destructive-command guard flags them.
 yolo skips approval and guard checks, not argument validation or timeouts."""
+
+# Shown when Pieni is started with no arguments at all: it cannot guess a provider,
+# so it explains how to start instead of failing.
+USAGE = """usage: pieni [PROVIDER] [-m MODEL] [-r PROMPT] [--permissions auto|yolo]
+
+Started with no arguments, Pieni prints this help and exits. To run it, pass a
+provider, or set provider and model in ~/.pieni/pieni.ini or ./pieni.ini:
+
+  pieni openai -m MODEL                  interactive session
+  pieni deepseek -m MODEL
+  pieni openrouter -m MODEL
+  pieni http://localhost:30000 -m MODEL  local OpenAI-compatible server
+  pieni openai -m MODEL -r "prompt"      run one task, then exit
+  pieni --help                           all command-line options"""
 
 YOLO_WARNING = ("warning: yolo skips approval and destructive-command checks; "
                 "commands run without asking.")
@@ -115,16 +138,21 @@ class ToolCall:
 
 
 class Reply:
-    """One normalized model reply: text, tool calls, and token usage."""
+    """One normalized model reply: text, tool calls, usage, and any thinking."""
 
-    __slots__ = ("text", "tool_calls", "input_tokens", "output_tokens", "estimated")
+    __slots__ = ("text", "tool_calls", "input_tokens", "output_tokens", "estimated",
+                 "thinking")
 
-    def __init__(self, text, tool_calls, input_tokens, output_tokens, estimated):
+    def __init__(self, text, tool_calls, input_tokens, output_tokens, estimated,
+                 thinking=""):
         self.text = text
         self.tool_calls = tool_calls
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.estimated = estimated
+        # Whatever reasoning the provider returned, for display only: thinking is
+        # never added to the conversation, so it costs no context and is not saved.
+        self.thinking = thinking
 
 
 class TaskUsage:
@@ -268,6 +296,70 @@ def format_arguments(arguments):
     if isinstance(arguments, dict):
         return ", ".join(f"{key}={short(value)}" for key, value in arguments.items())
     return short(arguments)
+
+
+def thinking_line(text, limit=THINK_TRACE_CHARACTERS):
+    """A single bounded line for a model's thinking trace, or "" when there is none."""
+    collapsed = " ".join((text or "").split())
+    if not collapsed:
+        return ""
+    if len(collapsed) > limit:
+        collapsed = f"{collapsed[:limit]}..."
+    return f"thinking: {collapsed}"
+
+
+def dot_writer(stream=None):
+    """A writer for progress dots, or None when no human is watching the output."""
+    stream = sys.stdout if stream is None else stream
+    try:
+        interactive = stream.isatty()
+    except (AttributeError, ValueError):  # detached or unusual stream
+        return None
+    if not interactive:
+        return None
+
+    def write(text):
+        stream.write(text)
+        stream.flush()
+
+    return write
+
+
+class WorkingDots:
+    """Prints "." every interval while a slow call is in flight.
+
+    The dots go to a raw character writer rather than the line-oriented output, so
+    they can be interleaved with a progress line without disturbing it.
+    """
+
+    def __init__(self, write=None, interval=THINK_DOT_INTERVAL):
+        self.write = write  # None means no progress dots at all
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = None
+        self._dotted = False
+
+    def __enter__(self):
+        if self.write is not None:
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.interval + 1)
+            self._thread = None
+        if self._dotted and self.write is not None:
+            self._dotted = False
+            self.write("\n")  # leave the cursor on a fresh line
+        return False
+
+    def _loop(self):
+        while not self._stop.wait(self.interval):
+            self.write(".")
+            self._dotted = True
 
 
 def format_tool_call(name, arguments, ok, detail, milliseconds):
@@ -640,6 +732,37 @@ def estimated_pair(wire_messages, tools, text, calls):
     return estimate_tokens(payload), estimate_tokens(written)
 
 
+def reasoning_text(value):
+    """Flatten a provider thinking field: a string, or objects carrying 'text' or 'summary'."""
+    if not value:
+        return ""
+    if isinstance(value, str):
+        return value
+    parts = []
+    for item in (value if isinstance(value, (list, tuple)) else [value]):
+        text = attribute(item, "text")
+        if not text:
+            text = reasoning_text(attribute(item, "summary"))
+        if text:
+            parts.append(str(text))
+    return "\n".join(parts)
+
+
+def thinking_from_message(message):
+    """Thinking text from a Chat Completions message, under whichever field name."""
+    for field in ("reasoning_content", "reasoning", "thinking"):
+        text = reasoning_text(attribute(message, field))
+        if text:
+            return text
+    return ""
+
+
+def thinking_from_output(items):
+    """Thinking text from Responses API output items of type 'reasoning'."""
+    parts = [reasoning_text(item) for item in items if attribute(item, "type") == "reasoning"]
+    return "\n".join(part for part in parts if part)
+
+
 def tool_calls_from_chat(message):
     calls = []
     for call in attribute(message, "tool_calls") or []:
@@ -666,7 +789,7 @@ def call_chat_completions(client, model, messages, tools):
     estimated = tokens is None
     if estimated:
         tokens = estimated_pair(wire, tools, text, calls)
-    return Reply(text, calls, tokens[0], tokens[1], estimated)
+    return Reply(text, calls, tokens[0], tokens[1], estimated, thinking_from_message(message))
 
 
 def call_responses(client, model, messages, tools):
@@ -679,8 +802,9 @@ def call_responses(client, model, messages, tools):
         request["tools"] = tools
     response = client.responses.create(**request)
     text = attribute(response, "output_text") or ""
+    items = attribute(response, "output") or []
     calls = []
-    for item in attribute(response, "output") or []:
+    for item in items:
         if attribute(item, "type") == "function_call":
             calls.append(ToolCall(attribute(item, "call_id"), attribute(item, "name"),
                                   attribute(item, "arguments") or "{}"))
@@ -690,7 +814,7 @@ def call_responses(client, model, messages, tools):
     estimated = tokens is None
     if estimated:
         tokens = estimated_pair(to_responses_input(rest), tools, text, calls)
-    return Reply(text, calls, tokens[0], tokens[1], estimated)
+    return Reply(text, calls, tokens[0], tokens[1], estimated, thinking_from_output(items))
 
 
 def call_openrouter(client, model, messages, tools):
@@ -710,7 +834,7 @@ def call_openrouter(client, model, messages, tools):
     estimated = tokens is None
     if estimated:
         tokens = estimated_pair(wire, tools, text, calls)
-    return Reply(text, calls, tokens[0], tokens[1], estimated)
+    return Reply(text, calls, tokens[0], tokens[1], estimated, thinking_from_message(message))
 
 
 def load_sdk(module_name, attribute_name):
@@ -900,7 +1024,7 @@ class Agent:
     """The loop: send context to the model, run requested tools, repeat."""
 
     def __init__(self, provider, store, session_id, instructions, messages,
-                 workspace, permissions, out=print):
+                 workspace, permissions, out=print, dots=None):
         self.provider = provider
         self.store = store
         self.session_id = session_id
@@ -909,7 +1033,10 @@ class Agent:
         self.workspace = Path(workspace).resolve()
         self.permissions = permissions
         self.tools = Toolbox(self.workspace, permissions)
+        self.tools = Toolbox(self.workspace, permissions)
         self.out = out
+        # None means "decide from the output stream itself"; tests pass a writer.
+        self.dots = dot_writer() if dots is None else dots
 
     # -- context ------------------------------------------------------------
 
@@ -925,6 +1052,17 @@ class Agent:
         payload = json.dumps(self.wire_messages(), ensure_ascii=False, default=str)
         payload += json.dumps(TOOL_SPECS, ensure_ascii=False)
         return estimate_tokens(payload)
+
+    # -- model calls --------------------------------------------------------
+
+    def ask(self, messages, use_tools=True):
+        """One model call, showing progress dots and any thinking the model returns."""
+        with WorkingDots(self.dots):
+            reply = self.provider.complete(messages, use_tools=use_tools)
+        trace = thinking_line(reply.thinking)
+        if trace:
+            self.out(trace)
+        return reply
 
     # -- one task -----------------------------------------------------------
 
@@ -948,14 +1086,17 @@ class Agent:
     def steps(self, usage):
         """Model and tool rounds until the model answers without tool calls."""
         for _ in range(MAX_STEPS):
-            reply = self.provider.complete(self.wire_messages())
+            reply = self.ask(self.wire_messages())
             usage.record(reply.input_tokens, reply.output_tokens, reply.estimated)
             self.remember(assistant_message(reply))
             if not reply.tool_calls:
                 self.out(reply.text.strip() or "(the model returned no text)")
                 return True
             self.run_tools(reply.tool_calls)
-        self.out(f"error: stopped after {MAX_STEPS} tool rounds without a final answer")
+        # The budget is spent: stop rather than loop forever. The context is kept,
+        # so the user can ask Pieni to continue where it left off.
+        self.out(f"error: stopped after {MAX_STEPS} tool rounds without a final answer; "
+                 f"the context is saved, so ask Pieni to continue if it was unfinished")
         return False
 
     def run_tools(self, calls):
@@ -1036,7 +1177,7 @@ class Agent:
             return False
         request = self.wire_messages() + [{"role": "user", "content": COMPACT_INSTRUCTION}]
         try:
-            reply = self.provider.complete(request, use_tools=False)
+            reply = self.ask(request, use_tools=False)
         except ProviderError as exc:
             self.out(f"compaction failed: {exc}; the context is unchanged")
             return False
@@ -1117,10 +1258,13 @@ def run_agent(arguments):
         session_id, messages = store.resume(provider.name, provider.model, str(workspace))
         if session_id is None:
             session_id = store.start_session(provider.name, provider.model, str(workspace))
-            print(f"new session with {provider.name}/{provider.model}")
+            session_line = f"new session with {provider.name}/{provider.model}"
         else:
-            print(f"resumed a session with {len(messages)} message(s) "
-                  f"({provider.name}/{provider.model})")
+            session_line = (f"resumed a session with {len(messages)} message(s) "
+                            f"({provider.name}/{provider.model})")
+        if arguments.run is None:
+            print(BANNER)  # greet an interactive session, once the start has worked
+        print(session_line)
         permissions = Permissions(
             settings["permissions"], workspace,
             approve=None if arguments.run is not None else cli_approve)
@@ -1142,8 +1286,14 @@ def run_agent(arguments):
 
 def main(argv=None):
     """Command-line entry point; returns the process exit code."""
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if not arguments:
+        print(BANNER)
+        print(USAGE)
+        print(HELP)
+        return 0
     try:
-        return run_agent(parse_args(sys.argv[1:] if argv is None else list(argv)))
+        return run_agent(parse_args(arguments))
     except ConfigError as exc:
         print(f"pieni: {exc}", file=sys.stderr)
         return 2

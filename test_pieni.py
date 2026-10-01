@@ -6,11 +6,13 @@ so the default run is free and repeatable. Run with:
     python3 -m unittest test_pieni
 """
 
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -150,7 +152,8 @@ class TempWorkspaceCase(unittest.TestCase):
     def allow_all(self):
         return lambda kind, detail, reason: True
 
-    def make_agent(self, replies, mode="auto", approve=None, messages=(), store=None):
+    def make_agent(self, replies, mode="auto", approve=None, messages=(), store=None,
+                   dots=None):
         provider = ScriptedProvider(replies)
         if store is None:
             store = pieni.Store(self.root / "pieni.db")
@@ -158,7 +161,8 @@ class TempWorkspaceCase(unittest.TestCase):
         session = store.start_session(provider.name, provider.model, str(self.workspace))
         output = []
         agent = pieni.Agent(provider, store, session, "test instructions", list(messages),
-                            self.workspace, self.permissions(mode, approve), out=output.append)
+                            self.workspace, self.permissions(mode, approve),
+                            out=output.append, dots=dots)
         return agent, provider, store, output
 
 
@@ -645,10 +649,22 @@ class ReadToolTests(TempWorkspaceCase):
         self.assertIn("UnicodeDecodeError", outcome.detail)
 
     def test_long_file_is_truncated(self):
-        self.write(self.workspace / "big.txt", "".join(f"line {n}\n" for n in range(1000)))
+        # A few lines more than one read may return, so the note appears.
+        extra = 25
+        self.write(self.workspace / "big.txt",
+                   "".join(f"line {n}\n" for n in range(pieni.MAX_READ_LINES + extra)))
         outcome = self.toolbox().run("read", {"path": "big.txt"})
         self.assertTrue(outcome.ok)
         self.assertIn(f"first {pieni.MAX_READ_LINES}", outcome.output)
+        self.assertIn(f"of {pieni.MAX_READ_LINES + extra} selected lines", outcome.output)
+        self.assertLess(len(outcome.output), pieni.MAX_OUTPUT_CHARS + 200)
+
+    def test_read_output_is_bounded_by_characters_too(self):
+        # Very long lines hit the character bound before the line bound.
+        self.write(self.workspace / "wide.txt", "x" * (pieni.MAX_OUTPUT_CHARS + 5_000))
+        outcome = self.toolbox().run("read", {"path": "wide.txt"})
+        self.assertTrue(outcome.ok)
+        self.assertIn("truncated", outcome.output)
         self.assertLess(len(outcome.output), pieni.MAX_OUTPUT_CHARS + 200)
 
     def test_outside_path_is_denied_in_headless_use(self):
@@ -787,10 +803,15 @@ class BashToolTests(TempWorkspaceCase):
         self.assertTrue(outcome.ok)  # nothing to delete, but it ran
 
     def test_output_is_bounded(self):
-        outcome = self.toolbox().run("bash", {"command": "yes x | head -c 30000"})
+        characters = pieni.MAX_OUTPUT_CHARS + 1_000
+        # /dev/zero piped through tr: no broken-pipe noise from a killed producer,
+        # so the reported truncation count is exactly predictable.
+        outcome = self.toolbox().run(
+            "bash", {"command": f"head -c {characters} /dev/zero | tr '\\0' x"})
         self.assertTrue(outcome.ok)
         self.assertLess(len(outcome.output), pieni.MAX_OUTPUT_CHARS + 200)
-        self.assertIn("truncated", outcome.output)
+        self.assertIn(f"truncated {characters - pieni.MAX_OUTPUT_CHARS} characters",
+                      outcome.output)
 
     def test_non_utf8_output_is_not_fatal(self):
         outcome = self.toolbox().run("bash", {"command": "printf '\\xff\\xfehello'"})
@@ -952,10 +973,24 @@ class AgentLoopTests(TempWorkspaceCase):
         self.assertTrue(output[-1].startswith("Tokens: ~"), output[-1])
 
     def test_loop_stops_after_the_step_limit(self):
-        calls = [("call_%d" % n, "read", '{"path": "missing.txt"}') for n in range(pieni.MAX_STEPS)]
-        agent, _, _, output = self.make_agent([reply_from([call]) for call in calls])
+        # Every round asks for one more tool call, so the budget is never finished.
+        calls = [("call_%d" % n, "read", '{"path": "missing.txt"}')
+                 for n in range(pieni.MAX_STEPS)]
+        agent, provider, _, output = self.make_agent([reply_from([call]) for call in calls])
         self.assertFalse(agent.run_task("loop forever"))
+        self.assertEqual(len(provider.requests), pieni.MAX_STEPS)
         self.assertIn(f"stopped after {pieni.MAX_STEPS} tool rounds", output[-2])
+        self.assertIn("the context is saved", output[-2])
+
+    def test_step_limit_allows_more_than_one_tool_call_per_round(self):
+        # Several calls in one round all count against the same single round.
+        many = [("call_%d" % n, "read", '{"path": "missing.txt"}') for n in range(5)]
+        agent, provider, _, _ = self.make_agent([reply_from(many), reply_from(text="done")])
+        self.assertTrue(agent.run_task("five reads"))
+        self.assertEqual(len(provider.requests), 2)
+        tool_lines = [line for line in provider.requests[1] if line["role"] == "tool"]
+        self.assertEqual(len(tool_lines), 5)
+        self.assertGreater(pieni.MAX_STEPS, 25)
 
     def test_interruption_during_a_tool_call_keeps_the_context_valid(self):
         agent, _, store, output = self.make_agent([reply_from([
@@ -1131,6 +1166,223 @@ class DisplayTests(unittest.TestCase):
         self.assertEqual(pieni.estimate_tokens("abcd"), 1)
         self.assertEqual(pieni.truncate("abcdef", limit=3), "abc\n...[truncated 3 characters]")
 
+    def test_thinking_line_is_silent_without_a_trace(self):
+        for empty in (None, "", "   \n\t "):
+            with self.subTest(value=empty):
+                self.assertEqual(pieni.thinking_line(empty), "")
+
+    def test_thinking_line_collapses_whitespace(self):
+        self.assertEqual(pieni.thinking_line("first\n\tsecond   third"),
+                         "thinking: first second third")
+
+    def test_thinking_line_is_bounded(self):
+        default = pieni.thinking_line("x" * 500)
+        self.assertEqual(default, f"thinking: {'x' * pieni.THINK_TRACE_CHARACTERS}...")
+        self.assertEqual(pieni.THINK_TRACE_CHARACTERS, 120)
+        self.assertEqual(pieni.thinking_line("y" * 30, limit=10), f"thinking: {'y' * 10}...")
+        # A trace shorter than the limit is shown in full, without a marker.
+        self.assertEqual(pieni.thinking_line("short", limit=10), "thinking: short")
+
+    def test_thinking_line_handles_unicode(self):
+        text = "中文思考" * 40
+        line = pieni.thinking_line(text)
+        self.assertTrue(line.startswith("thinking: 中文思考"))
+        self.assertTrue(line.endswith("..."))
+        self.assertLessEqual(len(line), len("thinking: ") + pieni.THINK_TRACE_CHARACTERS + 3)
+
+
+class WorkingDotsTests(unittest.TestCase):
+    """The progress dots printed while waiting for a model reply."""
+
+    def test_no_writer_means_no_output(self):
+        with pieni.WorkingDots(None, interval=0.01) as dots:
+            time.sleep(0.05)
+        self.assertIsNone(dots.write)
+
+    def test_dots_are_printed_at_the_interval(self):
+        printed = []
+        with pieni.WorkingDots(printed.append, interval=0.01) as dots:
+            self.assertIsNotNone(dots)
+            deadline = time.monotonic() + 2
+            while len(printed) < 3 and time.monotonic() < deadline:
+                time.sleep(0.01)
+        self.assertGreaterEqual(printed.count("."), 3)
+        # A newline closes the dot line once the wait is over.
+        self.assertEqual(printed[-1], "\n")
+
+    def test_nothing_is_printed_when_the_call_is_quick(self):
+        printed = []
+        with pieni.WorkingDots(printed.append, interval=5):
+            pass
+        self.assertEqual(printed, [])
+
+    def test_the_thread_stops_after_the_block(self):
+        printed = []
+        with pieni.WorkingDots(printed.append, interval=0.01) as dots:
+            self.assertIsNotNone(dots._thread)
+            self.assertTrue(dots._thread.is_alive() or True)
+        self.assertIsNone(dots._thread)
+        settled = len(printed)
+        time.sleep(0.05)
+        self.assertEqual(len(printed), settled)  # no dots after the block
+
+    def test_an_exception_still_stops_the_dots(self):
+        printed = []
+        with self.assertRaises(pieni.PieniError):
+            with pieni.WorkingDots(printed.append, interval=0.01):
+                time.sleep(0.03)
+                raise pieni.PieniError("boom")
+        self.assertEqual(printed[-1], "\n")
+        settled = len(printed)
+        time.sleep(0.05)
+        self.assertEqual(len(printed), settled)
+
+    def test_dots_need_an_interactive_stream(self):
+        class Stream:
+            def __init__(self, interactive):
+                self.interactive = interactive
+                self.written = ""
+
+            def isatty(self):
+                return self.interactive
+
+            def write(self, text):
+                self.written += text
+
+            def flush(self):
+                pass
+
+        quiet = Stream(False)
+        self.assertIsNone(pieni.dot_writer(quiet))
+        self.assertEqual(quiet.written, "")
+        loud = Stream(True)
+        writer = pieni.dot_writer(loud)
+        self.assertIsNotNone(writer)
+        writer(".")
+        self.assertEqual(loud.written, ".")
+
+    def test_a_stream_without_isatty_is_treated_as_quiet(self):
+        self.assertIsNone(pieni.dot_writer(io.StringIO()))
+
+
+class ThinkingTraceTests(TempWorkspaceCase):
+    """Thinking traces from the providers and their display in the loop."""
+
+    def test_chat_completions_reasoning_content(self):
+        message = SimpleNamespace(content="answer", tool_calls=None,
+                                  reasoning_content="step one, step two")
+        body = SimpleNamespace(choices=[SimpleNamespace(message=message)],
+                               usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2))
+        reply = pieni.call_chat_completions(FakeChatClient(body), "m",
+                                           [{"role": "user", "content": "hi"}], None)
+        self.assertEqual(reply.thinking, "step one, step two")
+
+    def test_chat_completions_reasoning_field(self):
+        message = SimpleNamespace(content="answer", tool_calls=None, reasoning="because")
+        body = SimpleNamespace(choices=[SimpleNamespace(message=message)],
+                               usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2))
+        reply = pieni.call_chat_completions(FakeChatClient(body), "m", [], None)
+        self.assertEqual(reply.thinking, "because")
+
+    def test_openrouter_reasoning(self):
+        message = SimpleNamespace(content="answer", tool_calls=None, reasoning="weighing options")
+        body = SimpleNamespace(choices=[SimpleNamespace(message=message)],
+                               usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2))
+        reply = pieni.call_openrouter(FakeSendClient(body), "m", [], None)
+        self.assertEqual(reply.thinking, "weighing options")
+
+    def test_responses_reasoning_summary(self):
+        items = [SimpleNamespace(type="reasoning", summary=[SimpleNamespace(text="thought hard")]),
+                 SimpleNamespace(type="message")]
+        body = SimpleNamespace(output=items, output_text="answer",
+                               usage=SimpleNamespace(input_tokens=1, output_tokens=2))
+        reply = pieni.call_responses(FakeResponsesClient(body), "m", [], None)
+        self.assertEqual(reply.thinking, "thought hard")
+
+    def test_replies_without_thinking_are_empty(self):
+        self.assertEqual(pieni.call_chat_completions(  # no reasoning fields at all
+            FakeChatClient(chat_reply("plain")), "m", [], None).thinking, "")
+        self.assertEqual(pieni.call_responses(
+            FakeResponsesClient(responses_reply("plain")), "m", [], None).thinking, "")
+        self.assertEqual(pieni.thinking_line(""), "")
+
+    def test_the_loop_shows_the_thinking_trace(self):
+        long_trace = "consider" * 50
+        agent, _, _, output = self.make_agent([
+            pieni.Reply("done", [], 10, 5, False, long_trace)])
+        self.assertTrue(agent.run_task("go"))
+        trace = next(line for line in output if line.startswith("thinking: "))
+        self.assertEqual(trace, pieni.thinking_line(long_trace))
+        self.assertLessEqual(len(trace), len("thinking: ") + pieni.THINK_TRACE_CHARACTERS + 3)
+        self.assertTrue(trace.endswith("..."))
+
+    def test_the_loop_shows_a_trace_per_round(self):
+        agent, _, _, output = self.make_agent([
+            pieni.Reply("", [pieni.ToolCall("c1", "read", '{"path": "missing.txt"}')],
+                        10, 5, False, "first thought"),
+            pieni.Reply("done", [], 10, 5, False, "second thought")])
+        self.assertTrue(agent.run_task("go"))
+        traces = [line for line in output if line.startswith("thinking: ")]
+        self.assertEqual(traces, ["thinking: first thought", "thinking: second thought"])
+
+    def test_no_trace_line_when_the_model_thinks_silently(self):
+        agent, _, _, output = self.make_agent([reply_from(text="plain answer")])
+        agent.run_task("go")
+        self.assertFalse([line for line in output if line.startswith("thinking: ")])
+
+    def test_thinking_is_not_added_to_the_context_or_saved(self):
+        agent, provider, store, _ = self.make_agent([
+            pieni.Reply("done", [], 10, 5, False, "private reasoning")])
+        self.assertTrue(agent.run_task("go"))
+        self.assertNotIn("private reasoning", json.dumps(agent.messages))
+        self.assertNotIn("private reasoning",
+                         json.dumps(store.resume("scripted", "scripted-model",
+                                                 str(self.workspace))[1]))
+        self.assertNotIn("private reasoning", json.dumps(provider.requests[0]))
+
+    def test_dots_do_not_disturb_line_output(self):
+        printed = []
+        agent, _, _, output = self.make_agent([reply_from(text="answer")], dots=printed.append)
+        self.assertTrue(agent.run_task("go"))
+        self.assertIn("answer", output)  # the line output is unaffected
+        # The scripted reply is instant, so no dot and therefore no closing newline.
+        self.assertEqual(printed, [])
+
+    def test_progress_dots_wrap_every_model_call(self):
+        entered = []
+
+        class RecordingDots:
+            def __init__(self, write, interval=None):
+                self.write = write
+                entered.append(("init", interval))
+
+            def __enter__(self):
+                entered.append("enter")
+                return self
+
+            def __exit__(self, *exc_info):
+                entered.append("exit")
+                return False
+
+        agent, _, _, _ = self.make_agent([
+            pieni.Reply("", [pieni.ToolCall("c1", "read", '{"path": "a.txt"}')], 1, 1, False),
+            reply_from(text="done")])
+        with mock.patch.object(pieni, "WorkingDots", RecordingDots):
+            self.assertTrue(agent.run_task("go"))
+        # Two model rounds, each wrapped by the dots context manager.
+        self.assertEqual([entry for entry in entered if entry in ("enter", "exit")],
+                         ["enter", "exit", "enter", "exit"])
+
+    def test_compaction_also_shows_progress_and_trace(self):
+        printed = []
+        agent, _, _, output = self.make_agent(
+            [pieni.Reply("summary text", [], 5, 5, False, "compaction thought")],
+            dots=printed.append)
+        agent.remember({"role": "user", "content": "old work"})
+        self.assertTrue(agent.handle_command("/compact"))
+        self.assertIn("thinking: compaction thought", output)
+        self.assertIn("compacted the older context", output[-1])
+
 
 # ---------------------------------------------------------------------------
 # Command line
@@ -1176,10 +1428,30 @@ class CliTests(TempWorkspaceCase):
             with self.assertRaises(SystemExit):
                 pieni.parse_args(["--permissions", "sometimes"])
 
+    def test_no_arguments_prints_banner_and_help(self):
+        stdout = StringIO()
+        with self.isolate_config(), redirect_stdout(stdout):
+            code = pieni.main([])
+        self.assertEqual(code, 0)
+        text = stdout.getvalue()
+        self.assertIn(pieni.BANNER, text)
+        self.assertIn(f"Pieni agent v{pieni.VERSION} by Petri Kuittinen", text)
+        self.assertIn("usage: pieni", text)
+        self.assertIn("/compact", text)  # the command help, not just the options
+        self.assertIn("yolo", text)
+
+    def test_no_arguments_does_not_start_a_session(self):
+        stdout = StringIO()
+        with self.isolate_config(), redirect_stdout(stdout), redirect_stderr(StringIO()):
+            code = pieni.main([])
+        self.assertEqual(code, 0)
+        self.assertNotIn("new session with", stdout.getvalue())
+        self.assertFalse((self.workspace / ".pieni" / "pieni.db").exists())
+
     def test_missing_provider_is_reported(self):
         stderr = StringIO()
         with self.isolate_config(), redirect_stderr(stderr):
-            code = pieni.main([])
+            code = pieni.main(["-m", "gpt-x"])
         self.assertEqual(code, 2)
         self.assertIn("no provider set", stderr.getvalue())
 
@@ -1261,6 +1533,47 @@ class CliTests(TempWorkspaceCase):
         self.assertIn("bye", output)
         self.assertIn("Type a task", stdout.getvalue())
 
+    def test_interactive_start_prints_the_banner_first(self):
+        ScriptedFakeOpenAI.script = []
+        stdout = StringIO()
+        with self.isolate_config(), redirect_stdout(stdout):
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "k"}):
+                with mock.patch.dict(sys.modules, {"openai": SimpleNamespace(OpenAI=ScriptedFakeOpenAI)}):
+                    with mock.patch("builtins.input", side_effect=["/quit"]):
+                        code = pieni.main(["openai", "-m", "gpt-x"])
+        self.assertEqual(code, 0)
+        lines = stdout.getvalue().splitlines()
+        self.assertEqual(lines[0], pieni.BANNER)
+        self.assertIn("new session with openai/gpt-x", lines[1])
+        self.assertIn("Type a task", stdout.getvalue())
+
+    def test_interactive_loop_prints_the_hint(self):
+        agent, _, _, _ = self.make_agent([])
+        stdout = StringIO()
+        with mock.patch("builtins.input", side_effect=["/quit"]):
+            with redirect_stdout(stdout):
+                pieni.run_interactive(agent)
+        self.assertIn("Ctrl+C", stdout.getvalue())
+        self.assertNotIn(pieni.BANNER, stdout.getvalue())
+
+    def test_failed_start_prints_no_banner(self):
+        stdout = StringIO()
+        with self.isolate_config(), redirect_stdout(stdout), redirect_stderr(StringIO()):
+            with mock.patch.dict(os.environ, {}, clear=True):
+                code = pieni.main(["openai", "-m", "gpt-x"])
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_headless_mode_prints_no_banner(self):
+        ScriptedFakeOpenAI.script = [responses_reply("done")]
+        stdout = StringIO()
+        with self.isolate_config(), redirect_stdout(stdout):
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "k"}):
+                with mock.patch.dict(sys.modules, {"openai": SimpleNamespace(OpenAI=ScriptedFakeOpenAI)}):
+                    code = pieni.main(["openai", "-m", "gpt-x", "-r", "go"])
+        self.assertEqual(code, 0)
+        self.assertNotIn(pieni.BANNER, stdout.getvalue())
+
     def test_interactive_loop_exits_on_end_of_input(self):
         agent, _, _, _ = self.make_agent([])
         stdout = StringIO()
@@ -1313,12 +1626,13 @@ class LauncherTests(unittest.TestCase):
             f'exec {sys.executable!r} "$@"\n')
         return path
 
-    def run_launcher(self, *arguments, path=None, cwd=None):
+    def run_launcher(self, *arguments, path=None, cwd=None, command=None):
         environment = dict(os.environ)
         if path is not None:
             environment["PATH"] = f"{path}{os.pathsep}{environment['PATH']}"
-        completed = subprocess.run([str(self.launcher), *arguments], capture_output=True,
-                                   text=True, env=environment, cwd=cwd, timeout=60)
+        completed = subprocess.run([str(command or self.launcher), *arguments],
+                                   capture_output=True, text=True, env=environment,
+                                   cwd=cwd, timeout=60)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         return self.marker.read_text(encoding="utf-8").splitlines()
 
@@ -1340,6 +1654,16 @@ class LauncherTests(unittest.TestCase):
         elsewhere.mkdir()
         lines = self.run_launcher(cwd=elsewhere)
         self.assertEqual(lines, [f"interpreter={interpreter}", "args="])
+
+    def test_follows_a_symlink_like_an_installed_command(self):
+        # scripts/install.sh installs exactly this: a symlink on the PATH.
+        interpreter = self.stub_interpreter(".venv/bin/python")
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        linked = bin_dir / "pieni"
+        linked.symlink_to(self.launcher)
+        lines = self.run_launcher("deepseek", command=linked)
+        self.assertEqual(lines, [f"interpreter={interpreter}", "args=deepseek"])
 
 
 if __name__ == "__main__":

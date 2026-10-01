@@ -9,7 +9,8 @@ working example over a complete product. Follow the scope and milestones in
 ## Keep it small
 
 - Keep all agent implementation in `pieni.py`, with a Bash launcher named `pieni`.
-  The launcher runs `.venv/bin/python` when it exists, else `python3`.
+  The launcher runs `.venv/bin/python` when it exists, else `python3`, and follows
+  symlinks so an installed command still finds its own files.
 - Use the Python standard library and only two direct external dependencies:
   `openai` and `openrouter`, listed in `requirements.txt`.
 - Use `openai` for OpenAI Responses and DeepSeek/custom Chat Completions;
@@ -38,7 +39,10 @@ working example over a complete product. Follow the scope and milestones in
 ## Tests and changes
 
 - Keep tests outside `pieni.py`; use standard-library `unittest` and mocks.
+- Test shell scripts with `unittest` too, by running them against temporary copies
+  (`test_install.py`) instead of the real home directory.
 - Install dependencies into a project virtualenv (`.venv`), never system-wide.
+  `scripts/install.sh` handles the Ubuntu install; it is tooling, not agent code.
 - Test the core behavior and failure paths, including permissions, paths,
   Unicode, persistence, and the tool-call loop.
 - Keep default tests offline and free of API charges. Live integration tests

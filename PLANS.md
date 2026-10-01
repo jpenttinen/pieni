@@ -29,6 +29,12 @@ Provide a small Bash launcher named `pieni`; tests live in separate Python files
   and shell output, marking truncation rather than flooding model context.
 - Preserve tool-call IDs and results when continuing the model conversation.
   Do not re-execute historical tool calls when resuming a session.
+- Cap a task at 500 model rounds (`MAX_STEPS`) so a confused model cannot loop
+  forever. One round may carry several tool calls, so this bounds the conversation
+  rather than individual calls. On reaching the cap, print the reason and keep the
+  context so the user can ask Pieni to continue.
+- Bound tool output: 5,000 lines per `read` (`MAX_READ_LINES`) and 65,536 characters
+  per tool result (`MAX_OUTPUT_CHARS`), marking truncation in both cases.
 
 ### Permissions
 
@@ -99,7 +105,13 @@ Provide a small Bash launcher named `pieni`; tests live in separate Python files
 ### Interaction and history
 
 - Start with a plain terminal prompt, not a full TUI. Print the full final answer.
-  Do not depend on exposed reasoning.
+  Never invent or summarize reasoning: show only the thinking text the model itself
+  returns, and skip the line when there is none.
+- Show progress while waiting for a model reply: one `.` per `THINK_DOT_INTERVAL`
+  second, only when the output is an interactive terminal, followed by a newline
+  before the next line. Show a reply's thinking trace as one line cut to
+  `THINK_TRACE_CHARACTERS` characters. Thinking is display-only: it is not added to
+  the conversation, saved, or sent back to the provider. Replies stay unstreamed.
 - After each tool call finishes, display its name/arguments, `ok` or `error`
   (with a short cause), and elapsed time in milliseconds, for example:
   `read(path="pieni.py") -> ok, 12 ms`. Denied, failed, timed-out, and interrupted
@@ -150,6 +162,9 @@ These are reviewable steps, not separate subsystems or a large PR program.
    selected provider/model; no paid calls in the default test run.
    Done: launcher, `requirements.txt`, README, `test_sdk_wire.py`, and
    `test_live.py` (opt-in); `pieni.py` is ~1,160 lines, above the ~750 guideline.
+   Also added `scripts/install.sh` (Ubuntu installer, tested by `test_install.py`)
+   with the launcher following symlinks so an installed command still finds its
+   own files; that is packaging, not agent scope.
 
 Mock each provider's SDK call, including OpenRouter client cleanup, tool-call
 continuation, usage extraction, and missing-key/provider errors. No live API
@@ -171,8 +186,9 @@ Keep the suite comprehensive for this scope, not a separate testing framework.
 ## Deferred, not promised
 
 - Advanced terminal editing, history navigation, multiline key bindings, and ESC.
-- Streaming reasoning displays, exact tokenizer-based accounting, model-specific
-  context-window discovery, and automatic compaction.
+- Streaming output and live streaming of reasoning as it arrives (the thinking trace
+  is shown after the reply completes, not token by token), exact tokenizer-based
+  accounting, model-specific context-window discovery, and automatic compaction.
 - Runtime provider/model switching and reasoning-effort controls.
 - Web search, including provider-native search or a Tavily fallback.
 - MCP, skills, plugins, multiple agent modes, and a true OS sandbox.

@@ -1,6 +1,6 @@
 # pieni
 
-**v0.1**
+**v0.12** — written by Petri Kuittinen, 2026.
 
 A tiny AI coding agent written in Python: one file of about 1,150 lines
 (`pieni.py`) plus a small Bash launcher (`pieni`). It is meant for learning how
@@ -14,7 +14,7 @@ This is the first working release. Headless mode has run successfully against al
 four provider paths: OpenAI, DeepSeek, OpenRouter, and a local OpenAI-compatible
 server. Interactive mode, approval prompts, and manual compaction are implemented
 and covered by the offline tests, but have had less real-terminal use, so treat
-them as the least tested part of v0.1.
+them as the least tested part of v0.12.
 
 Pieni supports these providers (set the API key as an environment variable):
 
@@ -29,8 +29,38 @@ Pieni supports these providers (set the API key as an environment variable):
 
 ## Install
 
-Create a virtual environment and install the two direct dependencies
-(`openai` and `openrouter`; everything else is the standard library):
+On Ubuntu Linux, the installer does everything: it checks the launcher, installs
+the Python dependencies if they are missing, and adds the `pieni` command to the
+PATH as a symlink to this checkout. It needs no sudo.
+
+```console
+./scripts/install.sh
+```
+
+What it does, step by step:
+
+1. Checks that `pieni`, `pieni.py`, and `requirements.txt` are in this checkout,
+   and that the launcher is executable and free of shell syntax errors.
+2. Checks `python3` (3.8 or newer).
+3. Checks whether `openai` and `openrouter` are importable. If not, it creates
+   `.venv` in this checkout and runs `pip install -r requirements.txt` there.
+4. Symlinks `~/.local/bin/pieni` to this checkout's launcher and runs
+   `pieni --help` to prove the installed command works.
+5. Warns if `~/.local/bin` is not on your PATH, and prints how to uninstall.
+
+Options: `--prefix DIR` installs into `DIR/bin` instead (`--prefix /usr/local`
+for a system-wide command, which needs write access there), `--skip-deps` leaves
+the Python packages alone, and `--dry-run` prints the actions without changing
+anything. Uninstall with `rm ~/.local/bin/pieni`.
+
+Because the command is a symlink to this checkout, `git pull` updates it, and
+moving or deleting the checkout breaks it.
+
+### Manual install
+
+If you prefer to do it by hand, create a virtual environment and install the two
+direct dependencies (`openai` and `openrouter`; everything else is the standard
+library):
 
 ```console
 python3 -m venv .venv
@@ -42,7 +72,7 @@ launcher uses `.venv/bin/python` automatically when that file exists, so you do
 not have to activate the environment:
 
 ```console
-./pieni openai -m "gpt-5"
+./pieni openai -m "gpt-6-luna"
 ```
 
 ## Configuration
@@ -69,28 +99,47 @@ in these files.
 ## CLI usage
 
 ```console
-./pieni                                       # provider and model from pieni.ini
-./pieni openai -m "gpt-5"                     # interactive session
+./pieni                                       # no arguments: banner and help, then exit
+./pieni openai -m "gpt-6-luna"                # interactive session
 ./pieni deepseek -m "deepseek-chat"
 ./pieni openrouter -m "vendor/model"
 ./pieni http://localhost:30000 -m "qwen3-30b" # local server
-./pieni openai -m "gpt-5" --permissions yolo
+./pieni openai -m "gpt-6-luna" --permissions yolo
 ```
+
+Started with no arguments, Pieni prints its banner, usage, and command list, then
+exits with status 0. Give it at least a provider, or set `provider` and `model` in
+`pieni.ini` and pass any other argument.
+
+## Interactive mode
+
+An interactive session greets you with the version banner and the startup state:
+
+```console
+./pieni deepseek -m "deepseek-chat"
+Pieni agent v0.12 by Petri Kuittinen
+resumed a session with 6 message(s) (deepseek/deepseek-chat)
+permissions: auto
+Type a task, or /help for commands. Ctrl+C interrupts, Ctrl+D exits.
+pieni>
+```
+
+Headless runs (`-r`) print no banner, so their output stays script-friendly.
 
 ## Headless mode
 
 ```console
-./pieni openai -m "gpt-5" -r "Explain this repository in five bullets."
+./pieni openai -m "gpt-6-luna" -r "Explain this repository in five bullets."
 ```
 
 `-r/--run` runs one task, prints the answer and the task summary, and exits. The
 exit code is nonzero when the task could not finish, and actions that would need
 approval are denied instead of waiting for input.
 
-Headless mode is the path verified in v0.1 across all providers:
+Headless mode is the path verified in v0.12 across all providers:
 
 ```console
-./pieni openai -m "gpt-5" -r "Summarize README.md."
+./pieni openai -m "gpt-6-luna" -r "Summarize README.md."
 ./pieni deepseek -m "deepseek-chat" -r "Summarize README.md."
 ./pieni openrouter -m "vendor/model" -r "Summarize README.md."
 ./pieni http://localhost:30000 -m "qwen3-30b" -r "Summarize README.md."
@@ -99,6 +148,8 @@ Headless mode is the path verified in v0.1 across all providers:
 Model names are examples only; use whatever your provider or local server offers.
 
 ## Commands
+
+The same list is printed when Pieni is started with no arguments.
 
 ```console
 /compact        replace older context with a model-written summary
@@ -122,7 +173,65 @@ output, and reports failures back to the model:
   ambiguous.
 - `bash` — run a shell command in the workspace with a timeout.
 
+A task gets at most **500 model rounds**. One round may ask for several tool calls
+at once, so this budgets the conversation with the model, not the number of
+individual tool calls. When the rounds run out, Pieni prints the task summary and
+keeps the context, so you can ask it to continue.
+
+## Limits
+
+Every tunable default is a constant near the top of `pieni.py`:
+
+| Constant | Default | Meaning |
+| --- | --- | --- |
+| `MAX_STEPS` | 500 | model rounds per task |
+| `MAX_READ_LINES` | 5,000 | lines returned by one `read`; the rest is marked as truncated |
+| `MAX_OUTPUT_CHARS` | 65,536 | characters of one tool result passed back to the model |
+| `THINK_TRACE_CHARACTERS` | 120 | characters of a model thinking trace shown |
+| `THINK_DOT_INTERVAL` | 1.0 | seconds between progress dots while waiting for the model |
+| `BASH_TIMEOUT` | 60 | seconds for one `bash` command (the tool may ask for 1-600) |
+| `CONTEXT_WINDOW` | 1,000,000 | window assumed by the context display (display only) |
+| `CHARS_PER_TOKEN` | 4 | characters per token in the fallback usage estimate |
+| `DEFAULT_PERMISSIONS` | `auto` | permissions when neither file nor CLI sets them |
+| `DB_PATH` | `.pieni/pieni.db` | saved conversations, under the workspace |
+| `PROMPT` | `pieni> ` | interactive prompt |
+| `VERSION` | `0.12` | shown in the banner |
+
+`MAX_READ_LINES` and `MAX_OUTPUT_CHARS` are independent: a `read` returns at most
+5,000 lines, and whatever a tool produces is cut off at 65,536 characters with a
+`[truncated N characters]` marker. A single `read` can therefore fill a large part
+of the model's context, and several large results in one task add up; the 1,000,000
+figure above is only the display assumption.
+
 ## Output
+
+While a model request is in flight, Pieni prints one `.` per second on an
+interactive terminal, so a slow reply does not look like a hang:
+
+```console
+pieni> explain this repository
+..
+```
+
+When the model reports its thinking, Pieni shows the beginning of it, cut to
+`THINK_TRACE_CHARACTERS` (120) characters:
+
+```console
+thinking: I should read the file first, then decide whether editing is enough. The task also mentions tests, so I will run them af...
+```
+
+Two honest limits on that trace:
+
+- Pieni does not ask any provider for reasoning, and reasoning summaries are usually
+  opt-in per model. The line appears only when the model already returns thinking
+  (`reasoning_content` on DeepSeek and compatible servers, `reasoning` on
+  OpenRouter, `reasoning` items in the OpenAI Responses API). Otherwise it is skipped.
+- Replies are not streamed, so the trace arrives once the reply is complete; the
+  dots cover the waiting time. What you see is the model's own thinking text, never
+  a Pieni summary of it.
+
+Thinking is display-only: it is not added to the conversation, so it costs no
+context and is not written to `.pieni/pieni.db`.
 
 After every tool call, Pieni prints a status line with the outcome and the elapsed
 time in milliseconds:
@@ -131,7 +240,6 @@ time in milliseconds:
 read(path="pieni.py") -> ok, 12 ms
 bash(command="python3 -m unittest test_pieni") -> error: exit code 1, 340 ms
 ```
-
 After every completed, failed, or interrupted task, it prints token usage, context
 usage against an assumed 1,000,000-token window, and elapsed time:
 
@@ -166,11 +274,18 @@ sensitive local data; API keys are never written to it.
 ## Tests
 
 The default suite is offline and free: every provider SDK is replaced by a fake,
-so no network access or API calls are needed. 128 tests:
+so no network access or API calls are needed. 188 tests (`test_pieni` 160,
+`test_install` 22, `test_sdk_wire` 6):
 
 ```console
-python3 -m unittest test_pieni
+python3 -m unittest test_pieni     # agent: config, tools, permissions, loop, CLI
+python3 -m unittest test_install   # the install script, against temporary copies
 ```
+
+`test_install.py` (22 tests) copies the checkout into a temporary directory, runs
+`scripts/install.sh` there with a temporary prefix, and never touches your home
+directory or the network; a stub interpreter stands in for python3 when the
+dependency path has to be exercised.
 
 `test_sdk_wire.py` (6 tests) checks the real request and response shapes against
 the installed `openai` and `openrouter` packages, using a loopback HTTP server on

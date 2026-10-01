@@ -64,9 +64,12 @@ Provide a small Bash launcher named `pieni`; tests live in separate Python files
 - Merge settings per key: local values override user values; omitted local keys
   retain user values. Explicit CLI arguments override both files; built-in
   defaults apply only when neither file nor CLI supplies a value.
-- Keep one `[pieni]` section with `provider`, `model`, and `permissions` settings.
-  Provider/model may come from configuration instead of CLI arguments; report a
-  clear error if either is still missing. Default permissions remain `auto`.
+- Keep one `[pieni]` section with `provider`, `model`, `permissions`, and `streaming`
+  settings. Provider/model may come from configuration instead of CLI arguments;
+  report a clear error if either is still missing. Default permissions remain
+  `auto`. Streaming defaults to `true` for every provider/model, including custom
+  endpoints. Accept standard INI booleans (`true/false`, `yes/no`, `on/off`, `1/0`);
+  reject invalid values clearly.
 - Missing files are fine. Report unreadable files, malformed INI, and invalid
   settings clearly. Read UTF-8 and disable interpolation to keep values literal.
 - API keys remain in environment variables, not configuration files. No config
@@ -87,7 +90,7 @@ Provide a small Bash launcher named `pieni`; tests live in separate Python files
     `OpenRouter` from `openrouter`, and manage the client with
     `with OpenRouter(api_key=os.getenv("OPENROUTER_API_KEY")) as client:`.
     Call `client.chat.send(model=model, messages=..., ...)` and read final text
-    from `response.choices[0].message.content`.
+    from `response.choices[0].message.content` when streaming is disabled.
   - Custom base URLs: use the `openai` SDK's Chat Completions API.
 - Normalize only the messages, tool calls/results, final text, and usage needed
   by the shared loop; do not build a general provider framework. Keep model names
@@ -99,6 +102,15 @@ Provide a small Bash launcher named `pieni`; tests live in separate Python files
   Provider and `-m` may be omitted when supplied by configuration.
 - `-r/--run "prompt"` runs one headless task. `--permissions auto|yolo` selects
   permissions for either interface; default is `auto`.
+- `--streaming` enables streaming; `--no-streaming` disables it. These mutually
+  exclusive CLI flags override the layered INI setting. When neither flag is
+  supplied, retain the file setting or the built-in `true` default.
+- Send `stream=True` on all provider paths when enabled. Display text fragments
+  immediately in interactive and headless use, assemble complete tool calls before
+  execution, and use final provider usage when available. Close streams on success,
+  failure, or interruption. Incomplete replies fail clearly without saving partial
+  assistant/tool-call messages or silently retrying in nonstreaming mode; users can
+  explicitly disable streaming for endpoints that do not support it.
 - API keys are not command-line arguments. Use placeholders in documentation
   examples so model names do not become stale requirements.
 
@@ -107,11 +119,13 @@ Provide a small Bash launcher named `pieni`; tests live in separate Python files
 - Start with a plain terminal prompt, not a full TUI. Print the full final answer.
   Never invent or summarize reasoning: show only the thinking text the model itself
   returns, and skip the line when there is none.
-- Show progress while waiting for a model reply: one `.` per `THINK_DOT_INTERVAL`
-  second, only when the output is an interactive terminal, followed by a newline
-  before the next line. Show a reply's thinking trace as one line cut to
+- Stream reply text by default, without printing the completed answer twice.
+  When streaming is disabled, show progress while waiting: one `.` per
+  `THINK_DOT_INTERVAL` second, only on an interactive terminal, followed by a newline
+  before the next line. Show a completed reply's thinking trace as one line cut to
   `THINK_TRACE_CHARACTERS` characters. Thinking is display-only: it is not added to
-  the conversation, saved, or sent back to the provider. Replies stay unstreamed.
+  the conversation, saved, or sent back to the provider; live reasoning remains
+  deferred.
 - After each tool call finishes, display its name/arguments, `ok` or `error`
   (with a short cause), and elapsed time in milliseconds, for example:
   `read(path="pieni.py") -> ok, 12 ms`. Denied, failed, timed-out, and interrupted
@@ -161,7 +175,9 @@ These are reviewable steps, not separate subsystems or a large PR program.
    and remaining failure-path tests. Optional live smoke tests with an explicitly
    selected provider/model; no paid calls in the default test run.
    Done: launcher, `requirements.txt`, README, `test_sdk_wire.py`, and
-   `test_live.py` (opt-in); `pieni.py` is ~1,160 lines, above the ~750 guideline.
+   `test_live.py` (opt-in); `pieni.py` is ~1,440 lines, above the ~750 guideline.
+   Streaming defaults, layered configuration, and failure-path tests are also
+   implemented (`test_streaming.py`); live streaming remains unverified.
    Also added `scripts/install.sh` (Ubuntu installer, tested by `test_install.py`)
    with the launcher following symlinks so an installed command still finds its
    own files; that is packaging, not agent scope.
@@ -177,7 +193,9 @@ three wire formats: Responses instructions/input items and the flat tool schema,
 Chat Completions tool nesting and tool results, and OpenRouter `chat.send`.
 
 Test user/local/CLI configuration precedence, missing and malformed INI files,
-invalid settings, successful and failing tool calls, malformed arguments, DCG approval/denial,
+invalid settings, streaming defaults/INI booleans/CLI overrides, fragmented text
+and multiple tool calls, stream cleanup/failure/interruption, no duplicated answers,
+successful and failing tool calls, malformed arguments, DCG approval/denial,
 headless behavior, path boundaries/symlinks, empty and Unicode text, output limits,
 resume without repeated tool execution, failed compaction, and tool/task summary
 formatting on success, failure, and interruption (including missing provider usage).
@@ -186,9 +204,9 @@ Keep the suite comprehensive for this scope, not a separate testing framework.
 ## Deferred, not promised
 
 - Advanced terminal editing, history navigation, multiline key bindings, and ESC.
-- Streaming output and live streaming of reasoning as it arrives (the thinking trace
-  is shown after the reply completes, not token by token), exact tokenizer-based
-  accounting, model-specific context-window discovery, and automatic compaction.
+- Live streaming of reasoning as it arrives (the thinking trace is shown after the
+  reply completes, not token by token), exact tokenizer-based accounting,
+  model-specific context-window discovery, and automatic compaction.
 - Runtime provider/model switching and reasoning-effort controls.
 - Web search, including provider-native search or a Tavily fallback.
 - MCP, skills, plugins, multiple agent modes, and a true OS sandbox.

@@ -47,6 +47,46 @@ def responses_reply(text="", calls=(), usage=True):
     return SimpleNamespace(output=items, output_text=text, usage=tokens)
 
 
+class FakeStream:
+    """Closable iterable, including mid-stream errors and interruptions."""
+
+    def __init__(self, events):
+        self.events = events
+        self.closed = False
+
+    def __iter__(self):
+        for event in self.events:
+            if isinstance(event, BaseException):
+                raise event
+            yield event
+
+    def close(self):
+        self.closed = True
+
+
+def fake_chat_stream(response):
+    events = []
+    for choice in pieni.attribute(response, "choices") or []:
+        message = pieni.attribute(choice, "message")
+        calls = []
+        for index, call in enumerate(pieni.attribute(message, "tool_calls") or []):
+            calls.append({"index": index, "id": pieni.attribute(call, "id"),
+                          "function": pieni.attribute(call, "function")})
+        delta = {"content": pieni.attribute(message, "content"), "tool_calls": calls,
+                 "reasoning_content": pieni.thinking_from_message(message)}
+        events.append({"choices": [{"index": 0, "delta": delta,
+                                   "finish_reason": "tool_calls" if calls else "stop"}]})
+    events.append({"choices": [], "usage": pieni.attribute(response, "usage")})
+    return FakeStream(events)
+
+
+def fake_responses_stream(response):
+    return FakeStream([
+        {"type": "response.output_text.delta", "delta": pieni.attribute(response, "output_text") or ""},
+        {"type": "response.completed", "response": response},
+    ])
+
+
 class FakeChatClient:
     """Stands in for an OpenAI Chat Completions client."""
 
@@ -59,7 +99,7 @@ class FakeChatClient:
         self.requests.append(kwargs)
         if isinstance(self.reply, BaseException):
             raise self.reply
-        return self.reply
+        return fake_chat_stream(self.reply) if kwargs.get("stream") else self.reply
 
 
 class FakeSendClient:
@@ -74,7 +114,7 @@ class FakeSendClient:
         self.requests.append(kwargs)
         if isinstance(self.reply, BaseException):
             raise self.reply
-        return self.reply
+        return fake_chat_stream(self.reply) if kwargs.get("stream") else self.reply
 
 
 class FakeResponsesClient:
@@ -89,7 +129,7 @@ class FakeResponsesClient:
         self.requests.append(kwargs)
         if isinstance(self.reply, BaseException):
             raise self.reply
-        return self.reply
+        return fake_responses_stream(self.reply) if kwargs.get("stream") else self.reply
 
 
 class ScriptedProvider:
@@ -174,7 +214,7 @@ class ConfigTests(TempWorkspaceCase):
 
     def test_defaults_when_no_file_exists(self):
         settings = pieni.load_config(cwd=self.workspace, home=self.home)
-        self.assertEqual(settings, {"provider": None, "model": None, "permissions": "auto"})
+        self.assertEqual(settings, {"provider": None, "model": None, "permissions": "auto", "streaming": True})
 
     def test_local_file_overrides_user_file_per_key(self):
         self.write(self.home / ".pieni" / "pieni.ini",
@@ -189,7 +229,7 @@ class ConfigTests(TempWorkspaceCase):
         self.write(self.home / ".pieni" / "pieni.ini", "[pieni]\nprovider = openai\n")
         self.write(self.workspace / "pieni.ini", "[pieni]\nprovider = openrouter\nmodel = a\n")
         settings = pieni.load_config("deepseek", "b", "yolo", cwd=self.workspace, home=self.home)
-        self.assertEqual(settings, {"provider": "deepseek", "model": "b", "permissions": "yolo"})
+        self.assertEqual(settings, {"provider": "deepseek", "model": "b", "permissions": "yolo", "streaming": True})
 
     def test_missing_home_directory_is_fine(self):
         settings = pieni.load_config(cwd=self.workspace, home=self.root / "nope")
@@ -371,10 +411,12 @@ class FakeOpenAI:
         FakeOpenAI.instances.append(self)
 
     def create_chat(self, **kwargs):
-        return chat_reply("chat answer")
+        body = chat_reply("chat answer")
+        return fake_chat_stream(body) if kwargs.get("stream") else body
 
     def create_responses(self, **kwargs):
-        return responses_reply("responses answer")
+        body = responses_reply("responses answer")
+        return fake_responses_stream(body) if kwargs.get("stream") else body
 
 
 class FakeOpenRouter:
@@ -392,7 +434,8 @@ class FakeOpenRouter:
 
     def send(self, **kwargs):
         self.requests.append(kwargs)
-        return chat_reply("openrouter answer")
+        body = chat_reply("openrouter answer")
+        return fake_chat_stream(body) if kwargs.get("stream") else body
 
     def __enter__(self):
         self.entered = True
@@ -1405,7 +1448,7 @@ class ScriptedFakeOpenAI:
         reply = type(self).script.pop(0)
         if isinstance(reply, BaseException):
             raise reply
-        return reply
+        return fake_responses_stream(reply) if kwargs.get("stream") else reply
 
 
 class CliTests(TempWorkspaceCase):

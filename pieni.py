@@ -29,7 +29,8 @@ from pathlib import Path
 APP_DIR = ".pieni"
 CONFIG_FILENAME = "pieni.ini"
 CONFIG_SECTION = "pieni"
-CONFIG_KEYS = ("provider", "model", "permissions")
+CONFIG_KEYS = ("provider", "model", "permissions", "streaming")
+DEFAULT_STREAMING = True
 PERMISSIONS = ("auto", "yolo")
 DEFAULT_PERMISSIONS = "auto"
 DB_PATH = Path(APP_DIR) / "pieni.db"
@@ -72,6 +73,7 @@ yolo skips approval and guard checks, not argument validation or timeouts."""
 # Shown when Pieni is started with no arguments at all: it cannot guess a provider,
 # so it explains how to start instead of failing.
 USAGE = """usage: pieni [PROVIDER] [-m MODEL] [-r PROMPT] [--permissions auto|yolo]
+             [--streaming | --no-streaming]
 
 Started with no arguments, Pieni prints this help and exits. To run it, pass a
 provider, or set provider and model in ~/.pieni/pieni.ini or ./pieni.ini:
@@ -226,18 +228,26 @@ def check_permissions(value, origin):
 
 
 def load_config(cli_provider=None, cli_model=None, cli_permissions=None,
-                cwd=None, home=None):
+                cwd=None, home=None, cli_streaming=None):
     """Merge built-in defaults, then the INI files, then CLI arguments."""
-    values = {"provider": None, "model": None, "permissions": DEFAULT_PERMISSIONS}
+    values = {"provider": None, "model": None, "permissions": DEFAULT_PERMISSIONS,
+              "streaming": DEFAULT_STREAMING}
     for path in config_paths(cwd or os.getcwd(), home):
         for key, value in read_config_file(path).items():
             if key == "permissions":
                 value = check_permissions(value, str(path))
+            if key == "streaming":
+                try:
+                    value = configparser.ConfigParser.BOOLEAN_STATES[value.lower()]
+                except KeyError:
+                    raise ConfigError(f"{path}: streaming must be a boolean, not '{value}'") from None
             values[key] = value
     for key, value in (("provider", cli_provider), ("model", cli_model),
                        ("permissions", cli_permissions)):
         if value:
             values[key] = value
+    if cli_streaming is not None:
+        values["streaming"] = cli_streaming
     return values
 
 
@@ -772,13 +782,88 @@ def tool_calls_from_chat(message):
     return calls
 
 
-def call_chat_completions(client, model, messages, tools):
+def collect_chat_stream(stream, on_text=None):
+    """Assemble indexed tool fragments; never execute a partially received call."""
+    text, thinking, calls = [], [], {}
+    usage, finished = None, False
+    try:
+        for event in stream:
+            if attribute(event, "error"):
+                raise ProviderError(f"stream error: {attribute(event, 'error')}")
+            if attribute(event, "usage") is not None:
+                usage = attribute(event, "usage")
+            for choice in attribute(event, "choices") or []:
+                if attribute(choice, "index", 0) != 0:
+                    continue
+                reason = attribute(choice, "finish_reason")
+                if reason is not None:
+                    if reason not in ("stop", "tool_calls", "function_call"):
+                        raise ProviderError(f"stream stopped with finish reason '{reason}'")
+                    finished = True
+                delta = attribute(choice, "delta")
+                content = attribute(delta, "content") or ""
+                if content:
+                    text.append(content)
+                    if on_text:
+                        on_text(content)
+                thinking.append(thinking_from_message(delta))
+                for fragment in attribute(delta, "tool_calls") or []:
+                    index = attribute(fragment, "index")
+                    if not isinstance(index, int) or index < 0:
+                        raise ProviderError("stream tool call has no valid index")
+                    call = calls.setdefault(index, {"id": "", "type": "function",
+                                                   "function": {"name": "", "arguments": ""}})
+                    call["id"] += attribute(fragment, "id") or ""
+                    function = attribute(fragment, "function")
+                    for field in ("name", "arguments"):
+                        call["function"][field] += attribute(function, field) or ""
+        if not finished:
+            raise ProviderError("stream ended before the reply finished")
+        for call in calls.values():
+            if not call["id"] or not call["function"]["name"]:
+                raise ProviderError("stream returned an incomplete tool call")
+        return {"choices": [{"message": {"content": "".join(text),
+                "reasoning_content": "".join(thinking),
+                "tool_calls": [calls[index] for index in sorted(calls)]}}], "usage": usage}
+    finally:
+        close = getattr(stream, "close", None)
+        if close:
+            close()
+
+
+def collect_responses_stream(stream, on_text=None):
+    """The completed Response holds full tool arguments, text, and usage."""
+    response = None
+    try:
+        for event in stream:
+            kind = attribute(event, "type")
+            if kind == "response.output_text.delta" and on_text:
+                on_text(attribute(event, "delta") or "")
+            elif kind == "response.completed":
+                response = attribute(event, "response")
+            elif kind in ("error", "response.failed", "response.incomplete"):
+                raise ProviderError(f"stream failed: {attribute(event, 'message') or kind}")
+        if response is None:
+            raise ProviderError("stream ended before the reply finished")
+        return response
+    finally:
+        close = getattr(stream, "close", None)
+        if close:
+            close()
+
+
+def call_chat_completions(client, model, messages, tools, streaming=DEFAULT_STREAMING, on_text=None):
     """OpenAI-compatible Chat Completions: DeepSeek and custom base URLs."""
     wire = to_chat_messages(messages)
     request = {"model": model, "messages": wire}
     if tools:
         request["tools"] = tools
+    request["stream"] = streaming
+    if streaming:
+        request["stream_options"] = {"include_usage": True}
     response = client.chat.completions.create(**request)
+    if streaming:
+        response = collect_chat_stream(response, on_text)
     choices = attribute(response, "choices") or []
     if not choices:
         raise ProviderError("the provider returned no choices")
@@ -792,7 +877,7 @@ def call_chat_completions(client, model, messages, tools):
     return Reply(text, calls, tokens[0], tokens[1], estimated, thinking_from_message(message))
 
 
-def call_responses(client, model, messages, tools):
+def call_responses(client, model, messages, tools, streaming=DEFAULT_STREAMING, on_text=None):
     """OpenAI Responses API."""
     instructions, rest = split_instructions(messages)
     request = {"model": model, "input": to_responses_input(rest)}
@@ -800,7 +885,10 @@ def call_responses(client, model, messages, tools):
         request["instructions"] = instructions
     if tools:
         request["tools"] = tools
+    request["stream"] = streaming
     response = client.responses.create(**request)
+    if streaming:
+        response = collect_responses_stream(response, on_text)
     text = attribute(response, "output_text") or ""
     items = attribute(response, "output") or []
     calls = []
@@ -817,13 +905,16 @@ def call_responses(client, model, messages, tools):
     return Reply(text, calls, tokens[0], tokens[1], estimated, thinking_from_output(items))
 
 
-def call_openrouter(client, model, messages, tools):
+def call_openrouter(client, model, messages, tools, streaming=DEFAULT_STREAMING, on_text=None):
     """OpenRouter SDK, which speaks the Chat Completions shape."""
     wire = to_chat_messages(messages)
     request = {"model": model, "messages": wire}
     if tools:
         request["tools"] = tools
+    request["stream"] = streaming
     response = client.chat.send(**request)
+    if streaming:
+        response = collect_chat_stream(response, on_text)
     choices = attribute(response, "choices") or []
     if not choices:
         raise ProviderError("the provider returned no choices")
@@ -854,23 +945,27 @@ def require_key(environment, variable, provider):
 class Provider:
     """Thin adapter over one SDK client; the loop only sees Reply objects."""
 
-    def __init__(self, name, model, kind, client, close=None):
+    def __init__(self, name, model, kind, client, close=None, streaming=DEFAULT_STREAMING):
         self.name = name
         self.model = model
         self.kind = kind
         self.client = client
         self._close = close
+        self.streaming = streaming
 
-    def complete(self, messages, use_tools=True):
+    def complete(self, messages, use_tools=True, on_text=None):
         try:
             if self.kind == "responses":
                 return call_responses(self.client, self.model, messages,
-                                      responses_tools() if use_tools else None)
+                                      responses_tools() if use_tools else None,
+                                      self.streaming, on_text)
             if self.kind == "openrouter":
                 return call_openrouter(self.client, self.model, messages,
-                                       chat_tools() if use_tools else None)
+                                       chat_tools() if use_tools else None,
+                                       self.streaming, on_text)
             return call_chat_completions(self.client, self.model, messages,
-                                         chat_tools() if use_tools else None)
+                                         chat_tools() if use_tools else None,
+                                         self.streaming, on_text)
         except PieniError:
             raise
         except Exception as exc:  # SDK and network failures become one clear message
@@ -882,7 +977,7 @@ class Provider:
             closing()
 
 
-def build_provider(provider_name, model, environment=None):
+def build_provider(provider_name, model, environment=None, streaming=DEFAULT_STREAMING):
     """Create the SDK client for provider_name (see PLANS.md 'Providers and CLI')."""
     environment = os.environ if environment is None else environment
     kind = provider_kind(provider_name)
@@ -892,13 +987,13 @@ def build_provider(provider_name, model, environment=None):
         if kind == "responses":
             require_key(environment, "OPENAI_API_KEY", "openai")
             OpenAI = load_sdk("openai", "OpenAI")
-            return Provider(provider_name, model, kind, OpenAI())
+            return Provider(provider_name, model, kind, OpenAI(), streaming=streaming)
         if kind == "chat":
             require_key(environment, "DEEPSEEK_API_KEY", "deepseek")
             OpenAI = load_sdk("openai", "OpenAI")
             client = OpenAI(api_key=environment["DEEPSEEK_API_KEY"],
                             base_url=DEEPSEEK_BASE_URL)
-            return Provider(provider_name, model, kind, client)
+            return Provider(provider_name, model, kind, client, streaming=streaming)
         if kind == "openrouter":
             require_key(environment, "OPENROUTER_API_KEY", "openrouter")
             OpenRouter = load_sdk("openrouter", "OpenRouter")
@@ -908,13 +1003,14 @@ def build_provider(provider_name, model, environment=None):
             except Exception:
                 stack.close()
                 raise
-            return Provider(provider_name, model, kind, client, close=stack.close)
+            return Provider(provider_name, model, kind, client, close=stack.close,
+                            streaming=streaming)
         # Custom base URL: the openai SDK's Chat Completions covers local servers,
         # which often need no key at all.
         OpenAI = load_sdk("openai", "OpenAI")
         client = OpenAI(api_key=environment.get("OPENAI_API_KEY") or "not-needed",
                         base_url=provider_name)
-        return Provider(provider_name, model, kind, client)
+        return Provider(provider_name, model, kind, client, streaming=streaming)
     except PieniError:
         raise
     except Exception as exc:
@@ -1024,7 +1120,7 @@ class Agent:
     """The loop: send context to the model, run requested tools, repeat."""
 
     def __init__(self, provider, store, session_id, instructions, messages,
-                 workspace, permissions, out=print, dots=None):
+                 workspace, permissions, out=print, dots=None, stream_out=None):
         self.provider = provider
         self.store = store
         self.session_id = session_id
@@ -1035,6 +1131,9 @@ class Agent:
         self.tools = Toolbox(self.workspace, permissions)
         self.tools = Toolbox(self.workspace, permissions)
         self.out = out
+        self.stream_out = stream_out or (lambda text: print(text, end="", flush=True)
+                                        if out is print else out(text))
+        self._streamed_text = False
         # None means "decide from the output stream itself"; tests pass a writer.
         self.dots = dot_writer() if dots is None else dots
 
@@ -1055,10 +1154,33 @@ class Agent:
 
     # -- model calls --------------------------------------------------------
 
-    def ask(self, messages, use_tools=True):
-        """One model call, showing progress dots and any thinking the model returns."""
-        with WorkingDots(self.dots):
-            reply = self.provider.complete(messages, use_tools=use_tools)
+    def ask(self, messages, use_tools=True, usage=None):
+        """Stream text, or show waiting dots; thinking remains a bounded final trace."""
+        self._streamed_text = False
+        partial = []
+
+        def show(text):
+            if text:
+                partial.append(text)
+                self._streamed_text = True
+                self.stream_out(text)
+
+        try:
+            if getattr(self.provider, "streaming", False):
+                reply = self.provider.complete(messages, use_tools=use_tools, on_text=show)
+            else:
+                with WorkingDots(self.dots):
+                    reply = self.provider.complete(messages, use_tools=use_tools)
+        except (ProviderError, KeyboardInterrupt):
+            if usage is not None:
+                # No completed usage report: estimate this attempt without retrying it.
+                inputs, outputs = estimated_pair(messages, TOOL_SPECS if use_tools else None,
+                                                 "".join(partial), [])
+                usage.record(inputs, outputs, True)
+            raise
+        finally:
+            if self._streamed_text:
+                self.stream_out("\n")
         trace = thinking_line(reply.thinking)
         if trace:
             self.out(trace)
@@ -1086,11 +1208,12 @@ class Agent:
     def steps(self, usage):
         """Model and tool rounds until the model answers without tool calls."""
         for _ in range(MAX_STEPS):
-            reply = self.ask(self.wire_messages())
+            reply = self.ask(self.wire_messages(), usage=usage)
             usage.record(reply.input_tokens, reply.output_tokens, reply.estimated)
             self.remember(assistant_message(reply))
             if not reply.tool_calls:
-                self.out(reply.text.strip() or "(the model returned no text)")
+                if not self._streamed_text:
+                    self.out(reply.text.strip() or "(the model returned no text)")
                 return True
             self.run_tools(reply.tool_calls)
         # The budget is spent: stop rather than loop forever. The context is kept,
@@ -1210,6 +1333,11 @@ def parse_args(argv):
     parser.add_argument("--permissions", choices=PERMISSIONS,
                         help="auto (default: ask only for actions the guard flags) "
                              "or yolo (skip approval and guard checks)")
+    streaming = parser.add_mutually_exclusive_group()
+    streaming.add_argument("--streaming", dest="streaming", action="store_true",
+                           default=None, help="stream model replies (default)")
+    streaming.add_argument("--no-streaming", dest="streaming", action="store_false",
+                           help="wait for complete model replies")
     return parser.parse_args(argv)
 
 
@@ -1245,13 +1373,15 @@ def run_interactive(agent):
 
 
 def run_agent(arguments):
-    settings = load_config(arguments.provider, arguments.model, arguments.permissions)
+    settings = load_config(arguments.provider, arguments.model, arguments.permissions,
+                           cli_streaming=arguments.streaming)
     provider_name = settings["provider"]
     if not provider_name:
         raise ConfigError("no provider set: pass a provider argument or add "
                           "provider to pieni.ini")
     workspace = Path.cwd()
-    provider = build_provider(provider_name, settings["model"] or "")
+    provider = build_provider(provider_name, settings["model"] or "",
+                              streaming=settings["streaming"])
     store = None
     try:
         store = Store(workspace / DB_PATH)

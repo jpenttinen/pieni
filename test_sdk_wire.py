@@ -67,6 +67,45 @@ def chat_body(text="", calls=(), system_fingerprint="fp_test"):
     }
 
 
+def stream_payload(body):
+    """Encode canned replies as real SSE, including fragmented tool arguments."""
+    events = []
+    if body.get("object") == "response":
+        for item in body["output"]:
+            for part in item.get("content", []):
+                text = part.get("text", "")
+                for fragment in (text[:2], text[2:]):
+                    events.append({"type": "response.output_text.delta", "delta": fragment,
+                                   "item_id": item["id"], "output_index": 0,
+                                   "content_index": 0, "sequence_number": len(events)})
+        events.append({"type": "response.completed", "response": body,
+                       "sequence_number": len(events)})
+    else:
+        base = {key: body[key] for key in ("id", "created", "model", "system_fingerprint")}
+        base["object"] = "chat.completion.chunk"
+        message = body["choices"][0]["message"]
+        delta = {"role": "assistant", "content": message.get("content")}
+        fragments = []
+        for index, call in enumerate(message.get("tool_calls", [])):
+            arguments = call["function"]["arguments"]
+            fragments.append({"index": index, "id": call["id"], "type": "function",
+                              "function": {"name": call["function"]["name"],
+                                           "arguments": arguments[:2]}})
+        if fragments:
+            delta["tool_calls"] = fragments
+        events.append(dict(base, choices=[{"index": 0, "delta": delta, "finish_reason": None}]))
+        if fragments:
+            tail = [{"index": index, "function": {"arguments": call["function"]["arguments"][2:]}}
+                    for index, call in enumerate(message["tool_calls"])]
+            events.append(dict(base, choices=[{"index": 0, "delta": {"tool_calls": tail},
+                                               "finish_reason": None}]))
+        events.append(dict(base, choices=[{"index": 0, "delta": {},
+                                           "finish_reason": "tool_calls" if fragments else "stop"}]))
+        events.append(dict(base, choices=[], usage=body["usage"]))
+    data = "".join("data: " + json.dumps(event) + "\n\n" for event in events)
+    return (data + "data: [DONE]\n\n").encode("utf-8")
+
+
 class Recorder:
     """Captured requests and the canned replies to send back."""
 
@@ -92,9 +131,11 @@ class LoopbackServer:
                 raw = self.rfile.read(length).decode("utf-8")
                 outer.recorder.requests.append(
                     {"path": self.path, "json": json.loads(raw or "{}")})
-                payload = json.dumps(outer.recorder.next_body()).encode("utf-8")
+                body = outer.recorder.next_body()
+                streaming = outer.recorder.requests[-1]["json"].get("stream", False)
+                payload = stream_payload(body) if streaming else json.dumps(body).encode("utf-8")
                 self.send_response(200)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", "text/event-stream" if streaming else "application/json")
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
@@ -155,6 +196,7 @@ class OpenAITests(unittest.TestCase):
 
         first_request = recorder.requests[0]["json"]
         self.assertEqual(recorder.requests[0]["path"], "/v1/responses")
+        self.assertTrue(first_request["stream"])
         self.assertEqual(first_request["model"], "test-model")
         self.assertEqual(first_request["instructions"], "sys")
         self.assertNotIn("system", [item.get("role") for item in first_request["input"]])
@@ -178,6 +220,16 @@ class OpenAITests(unittest.TestCase):
         self.assertEqual(second.text, "all done")
         self.assertIn({"type": "function_call_output", "call_id": "call_2", "output": "exit code 0"},
                       recorder.requests[1]["json"]["input"])
+
+    def test_nonstreaming_response_with_real_sdk(self):
+        from openai import OpenAI
+        recorder = Recorder([responses_body(text="buffered")])
+        with LoopbackServer(recorder) as server:
+            with OpenAI(api_key="test-key", base_url=server.url) as client:
+                reply = pieni.call_responses(client, "m", self.MESSAGES, None, streaming=False)
+        self.assertEqual(reply.text, "buffered")
+        self.assertFalse(recorder.requests[0]["json"]["stream"])
+
 
     def test_live_tool_schema_is_accepted_by_the_sdk_types(self):
         """The tool schema pieni builds must match the SDK's expected fields."""
@@ -218,6 +270,8 @@ class DeepSeekTests(unittest.TestCase):
                 provider.close()
 
         request = recorder.requests[0]["json"]
+        self.assertTrue(request["stream"])
+        self.assertEqual(request["stream_options"], {"include_usage": True})
         self.assertEqual(request["model"], "deepseek-chat")
         self.assertEqual(request["messages"][0], {"role": "system", "content": "sys"})
         self.assertEqual(request["tools"][0]["type"], "function")
@@ -253,6 +307,7 @@ class OpenRouterTests(unittest.TestCase):
                         pieni.chat_tools())
 
         request = recorder.requests[0]["json"]
+        self.assertTrue(request["stream"])
         self.assertEqual(request["model"], "vendor/model")
         self.assertEqual(request["messages"][0], {"role": "system", "content": "sys"})
         tool = request["tools"][0]

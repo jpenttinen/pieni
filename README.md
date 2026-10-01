@@ -2,7 +2,7 @@
 
 **v0.12** — written by Petri Kuittinen, 2026.
 
-A tiny AI coding agent written in Python: one file of about 1,150 lines
+A tiny AI coding agent written in Python: one file of about 1,440 lines
 (`pieni.py`) plus a small Bash launcher (`pieni`). It is meant for learning how
 agents work — read it, run it, fork it, change it.
 
@@ -14,7 +14,9 @@ This is the first working release. Headless mode has run successfully against al
 four provider paths: OpenAI, DeepSeek, OpenRouter, and a local OpenAI-compatible
 server. Interactive mode, approval prompts, and manual compaction are implemented
 and covered by the offline tests, but have had less real-terminal use, so treat
-them as the least tested part of v0.12.
+them as the least tested part of v0.12. Streaming is now enabled by default on
+all provider paths and covered by offline mocks and real-SDK loopback tests;
+this change has not been verified against live providers.
 
 Pieni supports these providers (set the API key as an environment variable):
 
@@ -90,11 +92,18 @@ Example:
 provider = deepseek
 model = deepseek-chat
 permissions = auto
+streaming = true
 ```
 
 Missing files are fine. Malformed INI files, unknown settings, or invalid values
 are reported with a clear error. API keys belong in environment variables, never
 in these files.
+
+Streaming defaults to `true` for every model and provider, including custom/local
+endpoints. Set `streaming = false` to wait for complete replies. Standard INI
+booleans (`true/false`, `yes/no`, `on/off`, `1/0`) are accepted, case-insensitively.
+`--streaming` and `--no-streaming` override the file setting; when neither is given,
+the configured value is preserved.
 
 ## CLI usage
 
@@ -105,6 +114,8 @@ in these files.
 ./pieni openrouter -m "vendor/model"
 ./pieni http://localhost:30000 -m "qwen3-30b" # local server
 ./pieni openai -m "gpt-6-luna" --permissions yolo
+./pieni openai -m "MODEL" --no-streaming       # wait for a complete reply
+./pieni deepseek -m "MODEL" --streaming       # override streaming = false
 ```
 
 Started with no arguments, Pieni prints its banner, usage, and command list, then
@@ -193,6 +204,7 @@ Every tunable default is a constant near the top of `pieni.py`:
 | `CONTEXT_WINDOW` | 1,000,000 | window assumed by the context display (display only) |
 | `CHARS_PER_TOKEN` | 4 | characters per token in the fallback usage estimate |
 | `DEFAULT_PERMISSIONS` | `auto` | permissions when neither file nor CLI sets them |
+| `DEFAULT_STREAMING` | `True` | streaming when neither file nor CLI sets it |
 | `DB_PATH` | `.pieni/pieni.db` | saved conversations, under the workspace |
 | `PROMPT` | `pieni> ` | interactive prompt |
 | `VERSION` | `0.12` | shown in the banner |
@@ -205,7 +217,17 @@ figure above is only the display assumption.
 
 ## Output
 
-While a model request is in flight, Pieni prints one `.` per second on an
+Model reply text is streamed as it arrives, in both interactive and headless
+mode. Pieni assembles full tool arguments before executing any tools and saves
+only completed replies. Final answers are not printed twice. Provider token
+usage is taken from the completed stream when available, otherwise estimated.
+
+An interrupted or failed stream is closed and reported without automatically
+retrying; partially displayed text is not saved as a completed reply. Task usage
+includes a labeled estimate for the failed attempt. If an endpoint does not
+support streaming, select `--no-streaming` or `streaming = false` explicitly.
+
+With streaming disabled, Pieni prints one `.` per second while waiting on an
 interactive terminal, so a slow reply does not look like a hang:
 
 ```console
@@ -226,9 +248,9 @@ Two honest limits on that trace:
   opt-in per model. The line appears only when the model already returns thinking
   (`reasoning_content` on DeepSeek and compatible servers, `reasoning` on
   OpenRouter, `reasoning` items in the OpenAI Responses API). Otherwise it is skipped.
-- Replies are not streamed, so the trace arrives once the reply is complete; the
-  dots cover the waiting time. What you see is the model's own thinking text, never
-  a Pieni summary of it.
+- Thinking itself is not streamed: the bounded trace appears after the reply
+  completes. What you see is the model's own thinking text, never a Pieni summary
+  of it. Progress dots are used only when reply streaming is disabled.
 
 Thinking is display-only: it is not added to the conversation, so it costs no
 context and is not written to `.pieni/pieni.db`.
@@ -274,12 +296,12 @@ sensitive local data; API keys are never written to it.
 ## Tests
 
 The default suite is offline and free: every provider SDK is replaced by a fake,
-so no network access or API calls are needed. 188 tests (`test_pieni` 160,
-`test_install` 22, `test_sdk_wire` 6):
+so no network access or API calls are needed. Run the agent and streaming tests
+alongside the installer tests:
 
 ```console
-python3 -m unittest test_pieni     # agent: config, tools, permissions, loop, CLI
-python3 -m unittest test_install   # the install script, against temporary copies
+python3 -m unittest test_pieni test_streaming  # agent and streaming behavior
+python3 -m unittest test_install               # installer, against temporary copies
 ```
 
 `test_install.py` (22 tests) copies the checkout into a temporary directory, runs
@@ -287,7 +309,7 @@ python3 -m unittest test_install   # the install script, against temporary copie
 directory or the network; a stub interpreter stands in for python3 when the
 dependency path has to be exercised.
 
-`test_sdk_wire.py` (6 tests) checks the real request and response shapes against
+`test_sdk_wire.py` checks streaming and buffered request/response shapes against
 the installed `openai` and `openrouter` packages, using a loopback HTTP server on
 127.0.0.1 instead of the providers. It needs the virtualenv on the path:
 
@@ -309,6 +331,6 @@ It is not part of the default run and costs whatever your provider charges.
 
 ## Not included
 
-Streaming output, automatic compaction, runtime provider/model switching,
+Live reasoning streaming, automatic compaction, runtime provider/model switching,
 reasoning-effort controls, web search, MCP, skills, plugins, multiple agent modes,
 and a real OS sandbox. See `PLANS.md` for the scope and `AGENTS.md` for the rules.

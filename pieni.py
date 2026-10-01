@@ -1,0 +1,1160 @@
+#!/usr/bin/env python3
+"""Pieni: a tiny educational coding agent in a single file.
+
+The file holds everything: configuration, four tools, permissions, SQLite
+persistence, and the loop that calls a model until it stops requesting tools.
+See PLANS.md for the intended scope and AGENTS.md for the development rules.
+"""
+
+import argparse
+import configparser
+import contextlib
+import importlib
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+# --- Constants -------------------------------------------------------------
+
+APP_DIR = ".pieni"
+CONFIG_FILENAME = "pieni.ini"
+CONFIG_SECTION = "pieni"
+CONFIG_KEYS = ("provider", "model", "permissions")
+PERMISSIONS = ("auto", "yolo")
+DEFAULT_PERMISSIONS = "auto"
+DB_PATH = Path(APP_DIR) / "pieni.db"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
+CONTEXT_WINDOW = 1_000_000  # display-only assumption, not a model's real limit
+CHARS_PER_TOKEN = 4         # crude estimate used only when usage is unavailable
+MAX_OUTPUT_CHARS = 20_000   # bound on tool output handed back to the model
+MAX_READ_LINES = 400
+BASH_TIMEOUT = 60
+MAX_STEPS = 25              # tool rounds per task before Pieni gives up
+PROMPT = "pieni> "
+
+SYSTEM_PROMPT = """You are Pieni, a small coding agent working in a local workspace.
+Use the tools to inspect and change files instead of guessing.
+Prefer small, focused changes and keep the project's existing style.
+Report failures and anything you did not verify; never invent results."""
+
+COMPACT_INSTRUCTION = (
+    "Summarize the conversation so far for your own future reference: the goal, "
+    "decisions made, files changed, and what is still unfinished. Be brief."
+)
+
+HELP = """commands:
+/compact        replace older context with a model-written summary
+/compact all    clear the context and start a fresh session
+/permissions    show permissions; /permissions auto|yolo changes them
+/help           this help
+/quit, /exit    leave
+
+auto runs shell commands unless the destructive-command guard flags them.
+yolo skips approval and guard checks, not argument validation or timeouts."""
+
+YOLO_WARNING = ("warning: yolo skips approval and destructive-command checks; "
+                "commands run without asking.")
+
+# Destructive-command guard (DCG). Best-effort patterns only: this is a
+# convenience check, not a security boundary and not a shell or SQL parser.
+DESTRUCTIVE_PATTERNS = (
+    (r"\brm\b[^&|;\n]*\s-\w*[rf]\w*", "rm with recursive/force flags"),
+    (r"\bmkfs(\.[a-z0-9]+)?\b", "filesystem format (mkfs)"),
+    (r"\bdd\b[^\n]*\bof=", "dd writing to a file or device"),
+    (r":\(\)\s*\{", "shell fork bomb"),
+    (r"\b(shutdown|reboot|halt|poweroff|init\s+0)\b", "system shutdown or reboot"),
+    (r"\bgit\s+push\b[^\n]*\s(--force|-f)(\s|$)", "git push --force"),
+    (r">\s*/dev/[sn]?[vd][a-z0-9]*", "redirect onto a raw device"),
+    (r"\b(DROP|TRUNCATE)\s+(TABLE|DATABASE|SCHEMA)\b", "SQL DROP or TRUNCATE"),
+    (r"\bDELETE\s+FROM\b(?![^\n]*\bWHERE\b)", "SQL DELETE without WHERE"),
+)
+
+
+# --- Errors and small value objects ----------------------------------------
+
+class PieniError(Exception):
+    """A failure Pieni can explain to the user instead of crashing."""
+
+
+class ConfigError(PieniError):
+    """Unreadable or invalid configuration."""
+
+
+class ProviderError(PieniError):
+    """The provider could not serve a request."""
+
+
+class ToolOutcome:
+    """Result of one tool call: ok flag, short cause, and text for the model."""
+
+    __slots__ = ("ok", "detail", "output")
+
+    def __init__(self, ok, detail, output):
+        self.ok = ok
+        self.detail = detail
+        self.output = output
+
+
+class ToolCall:
+    """A tool call requested by the model."""
+
+    __slots__ = ("id", "name", "arguments")
+
+    def __init__(self, id, name, arguments):
+        self.id = id
+        self.name = name
+        self.arguments = arguments  # raw JSON string as sent by the model
+
+
+class Reply:
+    """One normalized model reply: text, tool calls, and token usage."""
+
+    __slots__ = ("text", "tool_calls", "input_tokens", "output_tokens", "estimated")
+
+    def __init__(self, text, tool_calls, input_tokens, output_tokens, estimated):
+        self.text = text
+        self.tool_calls = tool_calls
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.estimated = estimated
+
+
+class TaskUsage:
+    """Token and time accounting for one task (one prompt up to the answer)."""
+
+    def __init__(self):
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.estimated = False  # True when any count came from a text estimate
+        self.elapsed_seconds = 0.0
+
+    @property
+    def total_tokens(self):
+        return self.input_tokens + self.output_tokens
+
+    def record(self, input_tokens, output_tokens, estimated):
+        self.input_tokens += int(input_tokens or 0)
+        self.output_tokens += int(output_tokens or 0)
+        self.estimated = self.estimated or bool(estimated)
+
+    def line(self, context_tokens):
+        """The task summary printed after every completed or interrupted task."""
+        label = "~" if self.estimated else ""
+        share = context_tokens / CONTEXT_WINDOW * 100
+        return (f"Tokens: {label}{self.total_tokens:,} | "
+                f"Context: ~{context_tokens:,} / {CONTEXT_WINDOW:,} ({share:.1f}%) | "
+                f"{self.elapsed_seconds:.1f} seconds")
+
+
+# --- Configuration ---------------------------------------------------------
+
+def config_paths(cwd, home=None):
+    """User settings first, then the file in the launch directory."""
+    home = Path(home) if home is not None else Path(os.path.expanduser("~"))
+    return [home / APP_DIR / CONFIG_FILENAME, Path(cwd) / CONFIG_FILENAME]
+
+
+def read_config_file(path):
+    """Return the [pieni] settings in path, or an empty mapping when it is absent."""
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            parser.read_file(handle)
+    except FileNotFoundError:
+        return {}
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"{path} is not valid UTF-8: {exc}") from exc
+    except OSError as exc:
+        raise ConfigError(f"cannot read {path}: {exc}") from exc
+    except configparser.Error as exc:
+        raise ConfigError(f"{path} is not a valid INI file: {exc}") from exc
+    if not parser.has_section(CONFIG_SECTION):
+        return {}
+    settings = {}
+    for key, raw in parser[CONFIG_SECTION].items():
+        if key not in CONFIG_KEYS:
+            raise ConfigError(f"{path}: unknown setting '{key}' "
+                              f"(known: {', '.join(CONFIG_KEYS)})")
+        value = raw.strip()
+        if not value:
+            raise ConfigError(f"{path}: setting '{key}' has an empty value")
+        settings[key] = value
+    return settings
+
+
+def check_permissions(value, origin):
+    if value not in PERMISSIONS:
+        raise ConfigError(f"{origin}: permissions must be {' or '.join(PERMISSIONS)}, "
+                          f"not '{value}'")
+    return value
+
+
+def load_config(cli_provider=None, cli_model=None, cli_permissions=None,
+                cwd=None, home=None):
+    """Merge built-in defaults, then the INI files, then CLI arguments."""
+    values = {"provider": None, "model": None, "permissions": DEFAULT_PERMISSIONS}
+    for path in config_paths(cwd or os.getcwd(), home):
+        for key, value in read_config_file(path).items():
+            if key == "permissions":
+                value = check_permissions(value, str(path))
+            values[key] = value
+    for key, value in (("provider", cli_provider), ("model", cli_model),
+                       ("permissions", cli_permissions)):
+        if value:
+            values[key] = value
+    return values
+
+
+def provider_kind(provider):
+    """Classify a provider name or base URL into one of the three wire formats."""
+    name = provider.strip().lower()
+    if name == "openai":
+        return "responses"
+    if name == "deepseek":
+        return "chat"
+    if name == "openrouter":
+        return "openrouter"
+    if re.match(r"^https?://", name):
+        return "custom"
+    raise ConfigError(f"unknown provider '{provider}': expected openai, openrouter, "
+                      f"deepseek, or an http(s) base URL")
+
+
+def build_instructions(workspace):
+    """System prompt plus AGENTS.md from the workspace root, when present."""
+    parts = [SYSTEM_PROMPT]
+    path = Path(workspace) / "AGENTS.md"
+    if path.is_file():
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ConfigError(f"cannot read {path}: {exc}") from exc
+        if text:
+            parts.append(f"Project instructions from AGENTS.md:\n{text}")
+    return "\n\n".join(parts)
+
+
+# --- Text helpers and display ---------------------------------------------
+
+def estimate_tokens(text):
+    """Rough token count from text length; used only when no usage is reported."""
+    if not text:
+        return 0
+    return max(1, len(text) // CHARS_PER_TOKEN)
+
+
+def truncate(text, limit=MAX_OUTPUT_CHARS):
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n...[truncated {len(text) - limit} characters]"
+
+
+def short(value, limit=60):
+    """One-line, bounded rendering of a tool argument for the status line."""
+    text = json.dumps(value, ensure_ascii=False) if isinstance(value, str) else repr(value)
+    text = " ".join(text.split())
+    return text if len(text) <= limit else f"{text[:limit]}..."
+
+
+def format_arguments(arguments):
+    if isinstance(arguments, dict):
+        return ", ".join(f"{key}={short(value)}" for key, value in arguments.items())
+    return short(arguments)
+
+
+def format_tool_call(name, arguments, ok, detail, milliseconds):
+    status = "ok" if ok else "error"
+    if detail:
+        status = f"{status}: {detail}"
+    return f"{name}({format_arguments(arguments)}) -> {status}, {milliseconds} ms"
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# --- Permissions -----------------------------------------------------------
+
+def dcg_reason(command):
+    """Why the destructive-command guard flags this command, or None when it does not."""
+    for pattern, reason in DESTRUCTIVE_PATTERNS:
+        if re.search(pattern, command, re.IGNORECASE):
+            return reason
+    return None
+
+
+def resolve_path(workspace, path):
+    """Resolve a tool path against the workspace, following '..' and symlinks."""
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = workspace / candidate
+    return candidate.resolve()
+
+
+def is_inside(path, root):
+    return path == root or root in path.parents
+
+
+class Permissions:
+    """Decides whether a tool action may run (see PLANS.md 'Permissions')."""
+
+    def __init__(self, mode, workspace, tempdir=None, approve=None):
+        self.mode = mode
+        self.workspace = Path(workspace).resolve()
+        self.tempdir = Path(tempdir or tempfile.gettempdir()).resolve()
+        self.approve = approve  # callable(kind, detail, reason) -> bool, or None
+
+    def check_file(self, resolved, action):
+        if self.mode == "yolo":
+            return True, ""
+        if is_inside(resolved, self.workspace) or is_inside(resolved, self.tempdir):
+            return True, ""
+        return self.ask("file", f"{action} {resolved}",
+                        "the path is outside the workspace and temp directory")
+
+    def check_shell(self, command):
+        if self.mode == "yolo":
+            return True, ""
+        reason = dcg_reason(command)
+        if not reason:
+            return True, ""
+        return self.ask("shell", command, f"destructive command guard: {reason}")
+
+    def ask(self, kind, detail, reason):
+        if self.approve is None:
+            return False, f"denied: {reason} (no approval in headless mode)"
+        if self.approve(kind, detail, reason):
+            return True, ""
+        return False, f"denied by the user: {reason}"
+
+
+def denied(reason):
+    return ToolOutcome(False, "denied", f"error: {reason}")
+
+
+# --- Tools -----------------------------------------------------------------
+
+TOOL_SPECS = (
+    {
+        "name": "read",
+        "description": "Read a UTF-8 text file, optionally a line range.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path, relative to the workspace or absolute."},
+                "start_line": {"type": "integer", "description": "First line to return, 1-based."},
+                "end_line": {"type": "integer", "description": "Last line to return, inclusive."},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "write",
+        "description": "Create or replace a UTF-8 text file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path, relative to the workspace or absolute."},
+                "content": {"type": "string", "description": "Full new content of the file."},
+            },
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "edit",
+        "description": "Replace one exact text match in a UTF-8 file. Fails when the "
+                       "text is missing or matches more than once.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path, relative to the workspace or absolute."},
+                "old_text": {"type": "string", "description": "Exact existing text to replace."},
+                "new_text": {"type": "string", "description": "Replacement text."},
+            },
+            "required": ["path", "old_text", "new_text"],
+        },
+    },
+    {
+        "name": "bash",
+        "description": "Run a shell command in the workspace and return its output.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Shell command to run."},
+                "timeout": {"type": "integer", "description": f"Seconds to wait, 1-600 (default {BASH_TIMEOUT})."},
+            },
+            "required": ["command"],
+        },
+    },
+)
+
+
+class Toolbox:
+    """The four tools, with argument validation, permissions, and output limits."""
+
+    def __init__(self, workspace, permissions):
+        self.workspace = Path(workspace).resolve()
+        self.permissions = permissions
+        self.handlers = {"read": self.read, "write": self.write,
+                         "edit": self.edit, "bash": self.bash}
+
+    def run(self, name, arguments):
+        handler = self.handlers.get(name)
+        if handler is None:
+            known = ", ".join(sorted(self.handlers))
+            return ToolOutcome(False, "unknown tool", f"error: unknown tool '{name}' (known: {known})")
+        try:
+            return handler(arguments)
+        except PieniError as exc:
+            return ToolOutcome(False, str(exc), f"error: {exc}")
+        except (OSError, UnicodeDecodeError, subprocess.SubprocessError) as exc:
+            return ToolOutcome(False, type(exc).__name__, f"error: {exc}")
+
+    # -- argument validation ------------------------------------------------
+
+    def keys(self, arguments, allowed):
+        unknown = set(arguments) - set(allowed)
+        if unknown:
+            raise PieniError(f"unknown argument(s): {', '.join(sorted(unknown))}")
+
+    def text(self, arguments, key):
+        value = arguments.get(key)
+        if not isinstance(value, str):
+            raise PieniError(f"argument '{key}' must be a string")
+        if not value:
+            raise PieniError(f"argument '{key}' must not be empty")
+        return value
+
+    def optional_int(self, arguments, key, default):
+        value = arguments.get(key)
+        if value is None:
+            return default
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise PieniError(f"argument '{key}' must be an integer")
+        return value
+
+    # -- tools ---------------------------------------------------------------
+
+    def read(self, arguments):
+        self.keys(arguments, ("path", "start_line", "end_line"))
+        path = self.text(arguments, "path")
+        resolved = resolve_path(self.workspace, path)
+        allowed, reason = self.permissions.check_file(resolved, "read")
+        if not allowed:
+            return denied(reason)
+        lines = resolved.read_text(encoding="utf-8").splitlines()
+        first = self.optional_int(arguments, "start_line", 1)
+        last = self.optional_int(arguments, "end_line", len(lines))
+        if first < 1 or last < first:
+            raise PieniError(f"invalid line range {first}-{last} for {len(lines)} lines")
+        selected = lines[first - 1:last]
+        notes = []
+        if len(selected) > MAX_READ_LINES:
+            notes.append(f"[showing the first {MAX_READ_LINES} of {len(selected)} selected lines]")
+            selected = selected[:MAX_READ_LINES]
+        header = f"{path} (lines {first}-{min(last, len(lines))} of {len(lines)})"
+        body = "\n".join([header] + notes + selected)
+        return ToolOutcome(True, "", truncate(body))
+
+    def write(self, arguments):
+        self.keys(arguments, ("path", "content"))
+        path = self.text(arguments, "path")
+        content = arguments.get("content")
+        if not isinstance(content, str):
+            raise PieniError("argument 'content' must be a string")
+        resolved = resolve_path(self.workspace, path)
+        allowed, reason = self.permissions.check_file(resolved, "write")
+        if not allowed:
+            return denied(reason)
+        existed = resolved.exists()
+        resolved.parent.mkdir(parents=True, exist_ok=True)  # allow new folders
+        resolved.write_text(content, encoding="utf-8")
+        action = "replaced" if existed else "created"
+        return ToolOutcome(True, "", f"{action} {path} ({len(content)} characters)")
+
+    def edit(self, arguments):
+        self.keys(arguments, ("path", "old_text", "new_text"))
+        path = self.text(arguments, "path")
+        old_text = self.text(arguments, "old_text")
+        new_text = arguments.get("new_text")
+        if not isinstance(new_text, str):
+            raise PieniError("argument 'new_text' must be a string")
+        resolved = resolve_path(self.workspace, path)
+        allowed, reason = self.permissions.check_file(resolved, "edit")
+        if not allowed:
+            return denied(reason)
+        text = resolved.read_text(encoding="utf-8")
+        matches = text.count(old_text)
+        if matches == 0:
+            raise PieniError(f"old_text not found in {path}")
+        if matches > 1:
+            raise PieniError(f"old_text matches {matches} times in {path}; "
+                             f"include more surrounding text to make it unique")
+        resolved.write_text(text.replace(old_text, new_text, 1), encoding="utf-8")
+        return ToolOutcome(True, "", f"replaced one occurrence in {path}")
+
+    def bash(self, arguments):
+        self.keys(arguments, ("command", "timeout"))
+        command = self.text(arguments, "command")
+        timeout = self.optional_int(arguments, "timeout", BASH_TIMEOUT)
+        if not 1 <= timeout <= 600:
+            raise PieniError("argument 'timeout' must be between 1 and 600 seconds")
+        allowed, reason = self.permissions.check_shell(command)
+        if not allowed:
+            return denied(reason)
+        try:
+            completed = subprocess.run(
+                command, shell=True, cwd=self.workspace, capture_output=True,
+                text=True, errors="replace", timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return ToolOutcome(False, f"timeout after {timeout}s",
+                               f"error: the command did not finish within {timeout} seconds")
+        output = (completed.stdout or "") + (completed.stderr or "")
+        if completed.returncode == 0:
+            return ToolOutcome(True, "", truncate(output or "(no output)"))
+        body = f"exit code {completed.returncode}\n{output or '(no output)'}"
+        return ToolOutcome(False, f"exit code {completed.returncode}", truncate(body))
+
+
+def parse_tool_arguments(raw):
+    """Arguments object for a tool call; raises PieniError when it is unusable."""
+    if isinstance(raw, dict):
+        return raw
+    if raw is None or raw == "":
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise PieniError(f"arguments are not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise PieniError("arguments must be a JSON object")
+    return parsed
+
+
+def tool_message(call_id, name, content):
+    return {"role": "tool", "tool_call_id": call_id, "name": name, "content": content}
+
+
+def assistant_message(reply):
+    message = {"role": "assistant", "content": reply.text}
+    if reply.tool_calls:
+        message["tool_calls"] = [{"id": call.id, "name": call.name,
+                                  "arguments": call.arguments} for call in reply.tool_calls]
+    return message
+
+
+# --- Providers -------------------------------------------------------------
+
+def chat_tools():
+    return [{"type": "function", "function": spec} for spec in TOOL_SPECS]
+
+
+def responses_tools():
+    return [{"type": "function", **spec} for spec in TOOL_SPECS]
+
+
+def to_chat_messages(messages):
+    """Canonical messages in Chat Completions wire shape."""
+    wire = []
+    for message in messages:
+        role = message["role"]
+        if role == "tool":
+            wire.append({"role": "tool", "tool_call_id": message["tool_call_id"],
+                         "content": message.get("content", "")})
+        elif role == "assistant":
+            calls = message.get("tool_calls") or []
+            # Tool-call messages carry no text; null content is the usual wire form.
+            entry = {"role": "assistant",
+                     "content": message.get("content") or (None if calls else "")}
+            if calls:
+                entry["tool_calls"] = [
+                    {"id": call["id"], "type": "function",
+                     "function": {"name": call["name"], "arguments": call["arguments"]}}
+                    for call in calls
+                ]
+            wire.append(entry)
+        else:
+            wire.append({"role": role, "content": message.get("content", "")})
+    return wire
+
+
+def to_responses_input(messages):
+    """Canonical messages in Responses API input shape; system text is passed separately."""
+    items = []
+    for message in messages:
+        role = message["role"]
+        if role == "system":
+            continue  # sent as instructions
+        if role == "tool":
+            items.append({"type": "function_call_output",
+                          "call_id": message["tool_call_id"],
+                          "output": message.get("content", "")})
+        elif role == "assistant":
+            if message.get("content"):
+                items.append({"role": "assistant", "content": message["content"]})
+            for call in message.get("tool_calls") or []:
+                items.append({"type": "function_call", "call_id": call["id"],
+                              "name": call["name"], "arguments": call["arguments"]})
+        else:
+            items.append({"role": role, "content": message.get("content", "")})
+    return items
+
+
+def split_instructions(messages):
+    text = "\n\n".join(m["content"] for m in messages if m["role"] == "system" and m.get("content"))
+    return text, [m for m in messages if m["role"] != "system"]
+
+
+def attribute(obj, name, default=None):
+    """Read a field from an SDK object or a plain dict."""
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def usage_pair(usage, input_name, output_name):
+    """(input, output) tokens from a provider usage object, or None when absent."""
+    if usage is None:
+        return None
+    inputs = attribute(usage, input_name)
+    outputs = attribute(usage, output_name)
+    if inputs is None or outputs is None:
+        return None
+    return int(inputs), int(outputs)
+
+
+def estimated_pair(wire_messages, tools, text, calls):
+    payload = json.dumps(wire_messages, ensure_ascii=False, default=str)
+    if tools:
+        payload += json.dumps(tools, ensure_ascii=False, default=str)
+    written = text + "".join(call.arguments or "" for call in calls)
+    return estimate_tokens(payload), estimate_tokens(written)
+
+
+def tool_calls_from_chat(message):
+    calls = []
+    for call in attribute(message, "tool_calls") or []:
+        function = attribute(call, "function")
+        calls.append(ToolCall(attribute(call, "id"), attribute(function, "name"),
+                              attribute(function, "arguments") or "{}"))
+    return calls
+
+
+def call_chat_completions(client, model, messages, tools):
+    """OpenAI-compatible Chat Completions: DeepSeek and custom base URLs."""
+    wire = to_chat_messages(messages)
+    request = {"model": model, "messages": wire}
+    if tools:
+        request["tools"] = tools
+    response = client.chat.completions.create(**request)
+    choices = attribute(response, "choices") or []
+    if not choices:
+        raise ProviderError("the provider returned no choices")
+    message = attribute(choices[0], "message")
+    text = attribute(message, "content") or ""
+    calls = tool_calls_from_chat(message)
+    tokens = usage_pair(attribute(response, "usage"), "prompt_tokens", "completion_tokens")
+    estimated = tokens is None
+    if estimated:
+        tokens = estimated_pair(wire, tools, text, calls)
+    return Reply(text, calls, tokens[0], tokens[1], estimated)
+
+
+def call_responses(client, model, messages, tools):
+    """OpenAI Responses API."""
+    instructions, rest = split_instructions(messages)
+    request = {"model": model, "input": to_responses_input(rest)}
+    if instructions:
+        request["instructions"] = instructions
+    if tools:
+        request["tools"] = tools
+    response = client.responses.create(**request)
+    text = attribute(response, "output_text") or ""
+    calls = []
+    for item in attribute(response, "output") or []:
+        if attribute(item, "type") == "function_call":
+            calls.append(ToolCall(attribute(item, "call_id"), attribute(item, "name"),
+                                  attribute(item, "arguments") or "{}"))
+    if not text and not calls:
+        raise ProviderError("the provider returned neither text nor tool calls")
+    tokens = usage_pair(attribute(response, "usage"), "input_tokens", "output_tokens")
+    estimated = tokens is None
+    if estimated:
+        tokens = estimated_pair(to_responses_input(rest), tools, text, calls)
+    return Reply(text, calls, tokens[0], tokens[1], estimated)
+
+
+def call_openrouter(client, model, messages, tools):
+    """OpenRouter SDK, which speaks the Chat Completions shape."""
+    wire = to_chat_messages(messages)
+    request = {"model": model, "messages": wire}
+    if tools:
+        request["tools"] = tools
+    response = client.chat.send(**request)
+    choices = attribute(response, "choices") or []
+    if not choices:
+        raise ProviderError("the provider returned no choices")
+    message = attribute(choices[0], "message")
+    text = attribute(message, "content") or ""
+    calls = tool_calls_from_chat(message)
+    tokens = usage_pair(attribute(response, "usage"), "prompt_tokens", "completion_tokens")
+    estimated = tokens is None
+    if estimated:
+        tokens = estimated_pair(wire, tools, text, calls)
+    return Reply(text, calls, tokens[0], tokens[1], estimated)
+
+
+def load_sdk(module_name, attribute_name):
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise ConfigError(f"missing dependency '{module_name}': "
+                          f"run pip install -r requirements.txt") from exc
+    return getattr(module, attribute_name)
+
+
+def require_key(environment, variable, provider):
+    if not environment.get(variable):
+        raise ConfigError(f"{provider} needs the {variable} environment variable")
+
+
+class Provider:
+    """Thin adapter over one SDK client; the loop only sees Reply objects."""
+
+    def __init__(self, name, model, kind, client, close=None):
+        self.name = name
+        self.model = model
+        self.kind = kind
+        self.client = client
+        self._close = close
+
+    def complete(self, messages, use_tools=True):
+        try:
+            if self.kind == "responses":
+                return call_responses(self.client, self.model, messages,
+                                      responses_tools() if use_tools else None)
+            if self.kind == "openrouter":
+                return call_openrouter(self.client, self.model, messages,
+                                       chat_tools() if use_tools else None)
+            return call_chat_completions(self.client, self.model, messages,
+                                         chat_tools() if use_tools else None)
+        except PieniError:
+            raise
+        except Exception as exc:  # SDK and network failures become one clear message
+            raise ProviderError(f"{self.name} request failed: {exc}") from exc
+
+    def close(self):
+        if self._close is not None:
+            closing, self._close = self._close, None
+            closing()
+
+
+def build_provider(provider_name, model, environment=None):
+    """Create the SDK client for provider_name (see PLANS.md 'Providers and CLI')."""
+    environment = os.environ if environment is None else environment
+    kind = provider_kind(provider_name)
+    if not model:
+        raise ConfigError("no model set: pass -m/--model or add model to pieni.ini")
+    try:
+        if kind == "responses":
+            require_key(environment, "OPENAI_API_KEY", "openai")
+            OpenAI = load_sdk("openai", "OpenAI")
+            return Provider(provider_name, model, kind, OpenAI())
+        if kind == "chat":
+            require_key(environment, "DEEPSEEK_API_KEY", "deepseek")
+            OpenAI = load_sdk("openai", "OpenAI")
+            client = OpenAI(api_key=environment["DEEPSEEK_API_KEY"],
+                            base_url=DEEPSEEK_BASE_URL)
+            return Provider(provider_name, model, kind, client)
+        if kind == "openrouter":
+            require_key(environment, "OPENROUTER_API_KEY", "openrouter")
+            OpenRouter = load_sdk("openrouter", "OpenRouter")
+            stack = contextlib.ExitStack()
+            try:
+                client = stack.enter_context(OpenRouter(api_key=environment["OPENROUTER_API_KEY"]))
+            except Exception:
+                stack.close()
+                raise
+            return Provider(provider_name, model, kind, client, close=stack.close)
+        # Custom base URL: the openai SDK's Chat Completions covers local servers,
+        # which often need no key at all.
+        OpenAI = load_sdk("openai", "OpenAI")
+        client = OpenAI(api_key=environment.get("OPENAI_API_KEY") or "not-needed",
+                        base_url=provider_name)
+        return Provider(provider_name, model, kind, client)
+    except PieniError:
+        raise
+    except Exception as exc:
+        raise ProviderError(f"cannot create the {provider_name} client: {exc}") from exc
+
+
+# --- Persistence -----------------------------------------------------------
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    workspace TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY,
+    session_id INTEGER NOT NULL REFERENCES sessions(id),
+    active INTEGER NOT NULL DEFAULT 1,
+    role TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+"""
+
+
+class Store:
+    """SQLite persistence for sessions, message logs, and the active context."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.connection = sqlite3.connect(self.path)
+            self.connection.row_factory = sqlite3.Row
+            self.connection.executescript(SCHEMA)
+            self.connection.commit()
+        except (OSError, sqlite3.Error) as exc:
+            raise PieniError(f"cannot open the database {self.path}: {exc}") from exc
+
+    def execute(self, sql, parameters=()):
+        try:
+            return self.connection.execute(sql, parameters)
+        except sqlite3.Error as exc:
+            raise PieniError(f"database error: {exc}") from exc
+
+    def commit(self):
+        try:
+            self.connection.commit()
+        except sqlite3.Error as exc:
+            raise PieniError(f"database error: {exc}") from exc
+
+    def resume(self, provider, model, workspace):
+        """Latest session for this provider, model, and workspace plus its active context."""
+        row = self.execute(
+            "SELECT id FROM sessions WHERE provider = ? AND model = ? AND workspace = ? "
+            "ORDER BY id DESC LIMIT 1", (provider, model, workspace)).fetchone()
+        if row is None:
+            return None, []
+        rows = self.execute("SELECT payload FROM messages WHERE session_id = ? AND active = 1 "
+                            "ORDER BY id", (row["id"],)).fetchall()
+        return row["id"], [self._decode(row["payload"]) for row in rows]
+
+    def start_session(self, provider, model, workspace):
+        cursor = self.execute("INSERT INTO sessions (provider, model, workspace, created_at) "
+                              "VALUES (?, ?, ?, ?)", (provider, model, workspace, now()))
+        self.commit()
+        return cursor.lastrowid
+
+    def add_message(self, session_id, message, active=True):
+        cursor = self.execute(
+            "INSERT INTO messages (session_id, active, role, payload, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (session_id, 1 if active else 0, message["role"],
+             json.dumps(message, ensure_ascii=False), now()))
+        self.commit()
+        return cursor.lastrowid
+
+    def last_message_id(self, session_id):
+        row = self.execute("SELECT MAX(id) AS newest FROM messages "
+                           "WHERE session_id = ? AND active = 1", (session_id,)).fetchone()
+        return row["newest"]
+
+    def deactivate(self, session_id, up_to_id):
+        self.execute("UPDATE messages SET active = 0 WHERE session_id = ? AND id <= ?",
+                     (session_id, up_to_id))
+        self.commit()
+
+    def close(self):
+        try:
+            self.connection.close()
+        except sqlite3.Error as exc:
+            raise PieniError(f"database error: {exc}") from exc
+
+    @staticmethod
+    def _decode(payload):
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise PieniError(f"a stored message is not valid JSON: {exc}") from exc
+
+
+# --- Agent loop ------------------------------------------------------------
+
+class Agent:
+    """The loop: send context to the model, run requested tools, repeat."""
+
+    def __init__(self, provider, store, session_id, instructions, messages,
+                 workspace, permissions, out=print):
+        self.provider = provider
+        self.store = store
+        self.session_id = session_id
+        self.instructions = instructions
+        self.messages = list(messages)  # conversation only, instructions excluded
+        self.workspace = Path(workspace).resolve()
+        self.permissions = permissions
+        self.tools = Toolbox(self.workspace, permissions)
+        self.out = out
+
+    # -- context ------------------------------------------------------------
+
+    def wire_messages(self):
+        return [{"role": "system", "content": self.instructions}] + self.messages
+
+    def remember(self, message):
+        self.messages.append(message)
+        return self.store.add_message(self.session_id, message, active=True)
+
+    def context_tokens(self):
+        """Rough size of the active context: instructions, tools, and messages."""
+        payload = json.dumps(self.wire_messages(), ensure_ascii=False, default=str)
+        payload += json.dumps(TOOL_SPECS, ensure_ascii=False)
+        return estimate_tokens(payload)
+
+    # -- one task -----------------------------------------------------------
+
+    def run_task(self, prompt):
+        """Run one task; always prints the usage summary. True when an answer was produced."""
+        usage = TaskUsage()
+        started = time.monotonic()
+        self.remember({"role": "user", "content": prompt})
+        finished = False
+        try:
+            finished = self.steps(usage)
+        except ProviderError as exc:
+            self.out(f"error: {exc}")
+        except KeyboardInterrupt:
+            self.out("interrupted")
+        finally:
+            usage.elapsed_seconds = time.monotonic() - started
+            self.out(usage.line(self.context_tokens()))
+        return finished
+
+    def steps(self, usage):
+        """Model and tool rounds until the model answers without tool calls."""
+        for _ in range(MAX_STEPS):
+            reply = self.provider.complete(self.wire_messages())
+            usage.record(reply.input_tokens, reply.output_tokens, reply.estimated)
+            self.remember(assistant_message(reply))
+            if not reply.tool_calls:
+                self.out(reply.text.strip() or "(the model returned no text)")
+                return True
+            self.run_tools(reply.tool_calls)
+        self.out(f"error: stopped after {MAX_STEPS} tool rounds without a final answer")
+        return False
+
+    def run_tools(self, calls):
+        for position, call in enumerate(calls):
+            try:
+                self.run_tool(call)
+            except KeyboardInterrupt:
+                # Keep the context valid: every tool call needs a result message,
+                # and an interrupted action may already have changed something.
+                for pending in calls[position:]:
+                    self.remember(tool_message(
+                        pending.id, pending.name,
+                        "error: interrupted before this call finished; "
+                        "the action may have taken partial effect"))
+                raise
+
+    def run_tool(self, call):
+        started = time.monotonic()
+        arguments = call.arguments
+        try:
+            arguments = parse_tool_arguments(call.arguments)
+            outcome = self.tools.run(call.name, arguments)
+        except PieniError as exc:
+            outcome = ToolOutcome(False, str(exc), f"error: {exc}")
+        elapsed_ms = int(round((time.monotonic() - started) * 1000))
+        self.out(format_tool_call(call.name, arguments, outcome.ok, outcome.detail, elapsed_ms))
+        self.remember(tool_message(call.id, call.name, outcome.output))
+        return outcome
+
+    # -- commands -----------------------------------------------------------
+
+    def handle_command(self, line):
+        """Handle a /command; returns False when Pieni should exit."""
+        parts = line.split()
+        command = parts[0]
+        argument = parts[1] if len(parts) > 1 else ""
+        if command in ("/quit", "/exit"):
+            self.out("bye")
+            return False
+        if command == "/help":
+            self.out(HELP)
+        elif command == "/permissions":
+            self.set_permissions(argument)
+        elif command == "/compact":
+            if argument == "all":
+                self.reset_context()
+            elif argument:
+                self.out("usage: /compact | /compact all")
+            else:
+                self.compact()
+        else:
+            self.out(f"unknown command '{command}'")
+        return True
+
+    def set_permissions(self, argument):
+        if not argument:
+            self.out(f"permissions: {self.permissions.mode}")
+            return
+        if argument not in PERMISSIONS:
+            self.out(f"permissions must be {' or '.join(PERMISSIONS)}")
+            return
+        self.permissions.mode = argument
+        self.out(f"permissions: {argument}")
+        if argument == "yolo":
+            self.out(YOLO_WARNING)
+
+    def reset_context(self):
+        self.session_id = self.store.start_session(self.provider.name, self.provider.model,
+                                                  str(self.workspace))
+        self.messages = []
+        self.out("cleared the context and started a new session")
+
+    def compact(self):
+        """Replace older context with a model-written summary; keep it if that fails."""
+        boundary = self.store.last_message_id(self.session_id)
+        if boundary is None:
+            self.out("nothing to compact")
+            return False
+        request = self.wire_messages() + [{"role": "user", "content": COMPACT_INSTRUCTION}]
+        try:
+            reply = self.provider.complete(request, use_tools=False)
+        except ProviderError as exc:
+            self.out(f"compaction failed: {exc}; the context is unchanged")
+            return False
+        except KeyboardInterrupt:
+            self.out("compaction interrupted; the context is unchanged")
+            return False
+        summary = (reply.text or "").strip()
+        if not summary:
+            self.out("compaction failed: the model returned no summary; the context is unchanged")
+            return False
+        message = {"role": "user", "content": f"[Summary of earlier conversation]\n{summary}"}
+        self.store.deactivate(self.session_id, boundary)
+        self.store.add_message(self.session_id, message, active=True)
+        self.messages = [message]
+        self.out("compacted the older context into a summary")
+        return True
+
+
+# --- Command line ----------------------------------------------------------
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="pieni",
+        description="A tiny educational coding agent. Settings come from "
+                    "~/.pieni/pieni.ini, then ./pieni.ini, then these arguments.")
+    parser.add_argument("provider", nargs="?",
+                        help="openai, openrouter, deepseek, or an http(s) base URL")
+    parser.add_argument("-m", "--model", help="model name to send to the provider")
+    parser.add_argument("-r", "--run", help="run one task, print the answer, and exit")
+    parser.add_argument("--permissions", choices=PERMISSIONS,
+                        help="auto (default: ask only for actions the guard flags) "
+                             "or yolo (skip approval and guard checks)")
+    return parser.parse_args(argv)
+
+
+def cli_approve(kind, detail, reason):
+    print(f"\n[approval needed] {kind}: {detail}\n  reason: {reason}")
+    try:
+        answer = input("approve? [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        print("")
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def run_interactive(agent):
+    print("Type a task, or /help for commands. Ctrl+C interrupts, Ctrl+D exits.")
+    while True:
+        try:
+            line = input(PROMPT)
+        except EOFError:
+            print("")
+            return 0
+        except KeyboardInterrupt:
+            print("")
+            return 0
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("/"):
+            if not agent.handle_command(line):
+                return 0
+        else:
+            agent.run_task(line)
+
+
+def run_agent(arguments):
+    settings = load_config(arguments.provider, arguments.model, arguments.permissions)
+    provider_name = settings["provider"]
+    if not provider_name:
+        raise ConfigError("no provider set: pass a provider argument or add "
+                          "provider to pieni.ini")
+    workspace = Path.cwd()
+    provider = build_provider(provider_name, settings["model"] or "")
+    store = None
+    try:
+        store = Store(workspace / DB_PATH)
+        session_id, messages = store.resume(provider.name, provider.model, str(workspace))
+        if session_id is None:
+            session_id = store.start_session(provider.name, provider.model, str(workspace))
+            print(f"new session with {provider.name}/{provider.model}")
+        else:
+            print(f"resumed a session with {len(messages)} message(s) "
+                  f"({provider.name}/{provider.model})")
+        permissions = Permissions(
+            settings["permissions"], workspace,
+            approve=None if arguments.run is not None else cli_approve)
+        print(f"permissions: {permissions.mode}")
+        if permissions.mode == "yolo":
+            print(YOLO_WARNING)
+        agent = Agent(provider, store, session_id, build_instructions(workspace),
+                      messages, workspace, permissions)
+        if arguments.run is not None:
+            if not arguments.run.strip():
+                raise ConfigError("-r/--run needs a non-empty prompt")
+            return 0 if agent.run_task(arguments.run) else 1
+        return run_interactive(agent)
+    finally:
+        if store is not None:
+            store.close()
+        provider.close()
+
+
+def main(argv=None):
+    """Command-line entry point; returns the process exit code."""
+    try:
+        return run_agent(parse_args(sys.argv[1:] if argv is None else list(argv)))
+    except ConfigError as exc:
+        print(f"pieni: {exc}", file=sys.stderr)
+        return 2
+    except PieniError as exc:
+        print(f"pieni: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("")
+        sys.exit(130)

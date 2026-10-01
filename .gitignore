@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Pieni saved conversations and settings
+.pieni/
+pieni.ini

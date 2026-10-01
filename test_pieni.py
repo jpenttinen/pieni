@@ -1,0 +1,1346 @@
+"""Offline tests for pieni.py.
+
+No network access and no API calls: every provider SDK is replaced by a fake,
+so the default run is free and repeatable. Run with:
+
+    python3 -m unittest test_pieni
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+import pieni
+
+
+# ---------------------------------------------------------------------------
+# Fakes
+# ---------------------------------------------------------------------------
+
+def chat_reply(text="", calls=(), prompt_tokens=100, completion_tokens=20, usage=True):
+    """A Chat Completions shaped reply; calls are (id, name, arguments) tuples."""
+    tool_calls = [SimpleNamespace(id=i, function=SimpleNamespace(name=n, arguments=a))
+                  for i, n, a in calls] or None
+    tokens = (SimpleNamespace(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+              if usage else None)
+    message = SimpleNamespace(content=text, tool_calls=tool_calls)
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=tokens)
+
+
+def responses_reply(text="", calls=(), usage=True):
+    """A Responses API shaped reply."""
+    items = [SimpleNamespace(type="function_call", call_id=i, name=n, arguments=a)
+             for i, n, a in calls]
+    if text:
+        items.append(SimpleNamespace(type="message"))
+    tokens = SimpleNamespace(input_tokens=50, output_tokens=10) if usage else None
+    return SimpleNamespace(output=items, output_text=text, usage=tokens)
+
+
+class FakeChatClient:
+    """Stands in for an OpenAI Chat Completions client."""
+
+    def __init__(self, reply):
+        self.reply = reply
+        self.requests = []
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+    def create(self, **kwargs):
+        self.requests.append(kwargs)
+        if isinstance(self.reply, BaseException):
+            raise self.reply
+        return self.reply
+
+
+class FakeSendClient:
+    """Stands in for an OpenRouter client."""
+
+    def __init__(self, reply):
+        self.reply = reply
+        self.requests = []
+        self.chat = SimpleNamespace(send=self.send)
+
+    def send(self, **kwargs):
+        self.requests.append(kwargs)
+        if isinstance(self.reply, BaseException):
+            raise self.reply
+        return self.reply
+
+
+class FakeResponsesClient:
+    """Stands in for client.responses on the openai SDK."""
+
+    def __init__(self, reply):
+        self.reply = reply
+        self.requests = []
+        self.responses = SimpleNamespace(create=self.create)
+
+    def create(self, **kwargs):
+        self.requests.append(kwargs)
+        if isinstance(self.reply, BaseException):
+            raise self.reply
+        return self.reply
+
+
+class ScriptedProvider:
+    """Returns prepared replies (or raises prepared exceptions) in order."""
+
+    name = "scripted"
+    model = "scripted-model"
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.requests = []
+
+    def complete(self, messages, use_tools=True):
+        self.requests.append(messages)
+        if not self.replies:
+            return pieni.Reply("done", [], 1, 1, False)
+        reply = self.replies.pop(0)
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
+
+    def close(self):
+        pass
+
+
+def reply_from(calls=(), text=""):
+    tool_calls = [pieni.ToolCall(call_id, name, arguments) for call_id, name, arguments in calls]
+    return pieni.Reply(text, tool_calls, 10, 5, False)
+
+
+class TempWorkspaceCase(unittest.TestCase):
+    """A temporary home, workspace, and temp directory per test."""
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.root = Path(self._tempdir.name)
+        self.workspace = self.root / "workspace"
+        self.workspace.mkdir()
+        self.home = self.root / "home"
+        self.home.mkdir()
+
+    def write(self, path, text):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def in_directory(self, path):
+        previous = os.getcwd()
+        os.chdir(path)
+        self.addCleanup(os.chdir, previous)
+
+    def permissions(self, mode="auto", approve=None):
+        return pieni.Permissions(mode, self.workspace, tempdir=self.root / "tmp", approve=approve)
+
+    def toolbox(self, mode="auto", approve=None):
+        return pieni.Toolbox(self.workspace, self.permissions(mode, approve))
+
+    def allow_all(self):
+        return lambda kind, detail, reason: True
+
+    def make_agent(self, replies, mode="auto", approve=None, messages=(), store=None):
+        provider = ScriptedProvider(replies)
+        if store is None:
+            store = pieni.Store(self.root / "pieni.db")
+            self.addCleanup(store.close)
+        session = store.start_session(provider.name, provider.model, str(self.workspace))
+        output = []
+        agent = pieni.Agent(provider, store, session, "test instructions", list(messages),
+                            self.workspace, self.permissions(mode, approve), out=output.append)
+        return agent, provider, store, output
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+class ConfigTests(TempWorkspaceCase):
+
+    def test_defaults_when_no_file_exists(self):
+        settings = pieni.load_config(cwd=self.workspace, home=self.home)
+        self.assertEqual(settings, {"provider": None, "model": None, "permissions": "auto"})
+
+    def test_local_file_overrides_user_file_per_key(self):
+        self.write(self.home / ".pieni" / "pieni.ini",
+                   "[pieni]\nprovider = openai\nmodel = user-model\npermissions = yolo\n")
+        self.write(self.workspace / "pieni.ini", "[pieni]\nmodel = local-model\n")
+        settings = pieni.load_config(cwd=self.workspace, home=self.home)
+        self.assertEqual(settings["provider"], "openai")
+        self.assertEqual(settings["model"], "local-model")
+        self.assertEqual(settings["permissions"], "yolo")
+
+    def test_cli_arguments_override_both_files(self):
+        self.write(self.home / ".pieni" / "pieni.ini", "[pieni]\nprovider = openai\n")
+        self.write(self.workspace / "pieni.ini", "[pieni]\nprovider = openrouter\nmodel = a\n")
+        settings = pieni.load_config("deepseek", "b", "yolo", cwd=self.workspace, home=self.home)
+        self.assertEqual(settings, {"provider": "deepseek", "model": "b", "permissions": "yolo"})
+
+    def test_missing_home_directory_is_fine(self):
+        settings = pieni.load_config(cwd=self.workspace, home=self.root / "nope")
+        self.assertEqual(settings["model"], None)
+
+    def test_malformed_ini_reports_the_file(self):
+        path = self.write(self.workspace / "pieni.ini", "this is not an ini file\n")
+        with self.assertRaises(pieni.ConfigError) as caught:
+            pieni.load_config(cwd=self.workspace, home=self.home)
+        self.assertIn(str(path), str(caught.exception))
+
+    def test_unknown_setting_is_rejected(self):
+        self.write(self.workspace / "pieni.ini", "[pieni]\nmodel = x\nprovider_api_key = secret\n")
+        with self.assertRaises(pieni.ConfigError) as caught:
+            pieni.load_config(cwd=self.workspace, home=self.home)
+        self.assertIn("provider_api_key", str(caught.exception))
+
+    def test_empty_value_is_rejected(self):
+        self.write(self.workspace / "pieni.ini", "[pieni]\nmodel =\n")
+        with self.assertRaises(pieni.ConfigError) as caught:
+            pieni.load_config(cwd=self.workspace, home=self.home)
+        self.assertIn("empty", str(caught.exception))
+
+    def test_invalid_permissions_are_rejected(self):
+        self.write(self.workspace / "pieni.ini", "[pieni]\npermissions = sometimes\n")
+        with self.assertRaises(pieni.ConfigError) as caught:
+            pieni.load_config(cwd=self.workspace, home=self.home)
+        self.assertIn("sometimes", str(caught.exception))
+
+    def test_other_sections_are_ignored(self):
+        self.write(self.workspace / "pieni.ini", "[other]\nmodel = x\n")
+        settings = pieni.load_config(cwd=self.workspace, home=self.home)
+        self.assertEqual(settings["model"], None)
+
+    def test_interpolation_is_disabled(self):
+        self.write(self.workspace / "pieni.ini", "[pieni]\nmodel = %(missing)s\n")
+        settings = pieni.load_config(cwd=self.workspace, home=self.home)
+        self.assertEqual(settings["model"], "%(missing)s")
+
+    def test_unreadable_file_is_reported(self):
+        directory = self.workspace / "pieni.ini"
+        directory.mkdir()
+        with self.assertRaises(pieni.ConfigError) as caught:
+            pieni.load_config(cwd=self.workspace, home=self.home)
+        self.assertIn("cannot read", str(caught.exception))
+
+    def test_provider_kind_classification(self):
+        self.assertEqual(pieni.provider_kind("OpenAI"), "responses")
+        self.assertEqual(pieni.provider_kind(" deepseek "), "chat")
+        self.assertEqual(pieni.provider_kind("openrouter"), "openrouter")
+        self.assertEqual(pieni.provider_kind("http://localhost:30000"), "custom")
+        with self.assertRaises(pieni.ConfigError):
+            pieni.provider_kind("gemini")
+
+    def test_instructions_include_agents_md(self):
+        self.write(self.workspace / "AGENTS.md", "Keep it small.\n")
+        text = pieni.build_instructions(self.workspace)
+        self.assertIn(pieni.SYSTEM_PROMPT, text)
+        self.assertIn("Keep it small.", text)
+
+    def test_instructions_without_agents_md(self):
+        self.assertEqual(pieni.build_instructions(self.workspace), pieni.SYSTEM_PROMPT)
+
+
+# ---------------------------------------------------------------------------
+# Provider adapters
+# ---------------------------------------------------------------------------
+
+class ProviderCallTests(unittest.TestCase):
+
+    MESSAGES = [{"role": "system", "content": "sys"},
+                {"role": "user", "content": "hi"}]
+
+    def test_chat_completions_normalizes_reply_and_request(self):
+        client = FakeChatClient(chat_reply("hello", [("call_1", "read", '{"path": "a.txt"}')]))
+        reply = pieni.call_chat_completions(client, "model-x", self.MESSAGES, pieni.chat_tools())
+        self.assertEqual(reply.text, "hello")
+        self.assertEqual(reply.tool_calls[0].id, "call_1")
+        self.assertEqual(reply.tool_calls[0].name, "read")
+        self.assertEqual(reply.tool_calls[0].arguments, '{"path": "a.txt"}')
+        self.assertFalse(reply.estimated)
+        self.assertEqual((reply.input_tokens, reply.output_tokens), (100, 20))
+        request = client.requests[0]
+        self.assertEqual(request["model"], "model-x")
+        self.assertEqual(request["messages"], self.MESSAGES)
+        self.assertEqual(request["tools"][0]["type"], "function")
+        self.assertIn("function", request["tools"][0])
+
+    def test_chat_completions_wire_shape_for_tool_results(self):
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "call_1", "name": "read", "arguments": '{"path": "a"}'}]},
+            {"role": "tool", "tool_call_id": "call_1", "name": "read", "content": "file body"},
+        ]
+        client = FakeChatClient(chat_reply("ok"))
+        pieni.call_chat_completions(client, "m", messages, None)
+        wire = client.requests[0]["messages"]
+        self.assertNotIn("tools", client.requests[0])
+        self.assertIsNone(wire[2]["content"])
+        self.assertEqual(wire[2]["tool_calls"][0]["function"]["name"], "read")
+        self.assertEqual(wire[3], {"role": "tool", "tool_call_id": "call_1", "content": "file body"})
+
+    def test_chat_completions_estimates_usage_when_missing(self):
+        client = FakeChatClient(chat_reply("some answer", usage=False))
+        reply = pieni.call_chat_completions(client, "m", self.MESSAGES, pieni.chat_tools())
+        self.assertTrue(reply.estimated)
+        self.assertGreater(reply.input_tokens, 0)
+        self.assertGreater(reply.output_tokens, 0)
+
+    def test_chat_completions_requires_a_choice(self):
+        client = FakeChatClient(SimpleNamespace(choices=[], usage=None))
+        with self.assertRaises(pieni.ProviderError):
+            pieni.call_chat_completions(client, "m", self.MESSAGES, None)
+
+    def test_responses_normalizes_reply_and_request(self):
+        client = FakeResponsesClient(responses_reply("answer", [("call_9", "bash", '{"command": "ls"}')]))
+        messages = self.MESSAGES + [
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "call_9", "name": "bash", "arguments": '{"command": "ls"}'}]},
+            {"role": "tool", "tool_call_id": "call_9", "name": "bash", "content": "files"},
+        ]
+        reply = pieni.call_responses(client, "gpt-x", messages, pieni.responses_tools())
+        self.assertEqual(reply.text, "answer")
+        self.assertEqual(reply.tool_calls[0].id, "call_9")
+        self.assertEqual((reply.input_tokens, reply.output_tokens), (50, 10))
+        request = client.requests[0]
+        self.assertEqual(request["instructions"], "sys")
+        self.assertEqual(request["input"][0], {"role": "user", "content": "hi"})
+        self.assertEqual(request["input"][2],
+                         {"type": "function_call_output", "call_id": "call_9", "output": "files"})
+        self.assertEqual(request["tools"][0]["name"], "read")
+        self.assertNotIn("function", request["tools"][0])
+
+    def test_responses_estimates_usage_when_missing(self):
+        client = FakeResponsesClient(responses_reply("answer", usage=False))
+        reply = pieni.call_responses(client, "m", self.MESSAGES, None)
+        self.assertTrue(reply.estimated)
+        self.assertGreater(reply.input_tokens, 0)
+
+    def test_responses_rejects_an_empty_reply(self):
+        client = FakeResponsesClient(SimpleNamespace(output=[], output_text="", usage=None))
+        with self.assertRaises(pieni.ProviderError):
+            pieni.call_responses(client, "m", self.MESSAGES, None)
+
+    def test_openrouter_uses_chat_send(self):
+        client = FakeSendClient(chat_reply("openrouter answer",
+                                          [("call_2", "write", '{"path": "a"}')]))
+        reply = pieni.call_openrouter(client, "vendor/model", self.MESSAGES, pieni.chat_tools())
+        self.assertEqual(reply.text, "openrouter answer")
+        self.assertEqual(reply.tool_calls[0].name, "write")
+        self.assertEqual(client.requests[0]["model"], "vendor/model")
+        self.assertEqual(client.requests[0]["messages"], self.MESSAGES)
+
+    def test_provider_wraps_sdk_failures(self):
+        client = FakeChatClient(RuntimeError("connection reset"))
+        provider = pieni.Provider("deepseek", "m", "chat", client)
+        with self.assertRaises(pieni.ProviderError) as caught:
+            provider.complete(self.MESSAGES)
+        self.assertIn("connection reset", str(caught.exception))
+
+    def test_provider_without_tools_skips_the_tool_schema(self):
+        client = FakeChatClient(chat_reply("summary"))
+        provider = pieni.Provider("deepseek", "m", "chat", client)
+        provider.complete(self.MESSAGES, use_tools=False)
+        self.assertNotIn("tools", client.requests[0])
+
+
+class FakeOpenAI:
+    """Fake `openai.OpenAI` recording constructor arguments."""
+
+    instances = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create_chat))
+        self.responses = SimpleNamespace(create=self.create_responses)
+        FakeOpenAI.instances.append(self)
+
+    def create_chat(self, **kwargs):
+        return chat_reply("chat answer")
+
+    def create_responses(self, **kwargs):
+        return responses_reply("responses answer")
+
+
+class FakeOpenRouter:
+    """Fake `openrouter.OpenRouter` that records context manager use."""
+
+    instances = []
+
+    def __init__(self, api_key=None):
+        self.api_key = api_key
+        self.entered = False
+        self.exited = False
+        self.requests = []
+        self.chat = SimpleNamespace(send=self.send)
+        FakeOpenRouter.instances.append(self)
+
+    def send(self, **kwargs):
+        self.requests.append(kwargs)
+        return chat_reply("openrouter answer")
+
+    def __enter__(self):
+        self.entered = True
+        return self
+
+    def __exit__(self, *exc_info):
+        self.exited = True
+        return False
+
+
+class BuildProviderTests(unittest.TestCase):
+
+    def setUp(self):
+        FakeOpenAI.instances = []
+        FakeOpenRouter.instances = []
+        self.sdks = {"openai": SimpleNamespace(OpenAI=FakeOpenAI),
+                     "openrouter": SimpleNamespace(OpenRouter=FakeOpenRouter)}
+        patcher = mock.patch.dict(sys.modules, self.sdks)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_openai_uses_the_responses_api(self):
+        provider = pieni.build_provider("openai", "gpt-x", {"OPENAI_API_KEY": "k"})
+        self.assertEqual(provider.kind, "responses")
+        self.assertEqual(FakeOpenAI.instances[-1].kwargs, {})
+        reply = provider.complete([{"role": "user", "content": "hi"}])
+        self.assertEqual(reply.text, "responses answer")
+
+    def test_missing_keys_are_reported(self):
+        with self.assertRaises(pieni.ConfigError) as caught:
+            pieni.build_provider("openai", "gpt-x", {})
+        self.assertIn("OPENAI_API_KEY", str(caught.exception))
+        with self.assertRaises(pieni.ConfigError) as caught:
+            pieni.build_provider("openrouter", "m", {})
+        self.assertIn("OPENROUTER_API_KEY", str(caught.exception))
+        with self.assertRaises(pieni.ConfigError) as caught:
+            pieni.build_provider("deepseek", "m", {})
+        self.assertIn("DEEPSEEK_API_KEY", str(caught.exception))
+
+    def test_deepseek_uses_chat_completions_and_its_base_url(self):
+        provider = pieni.build_provider("deepseek", "deepseek-chat", {"DEEPSEEK_API_KEY": "k"})
+        self.assertEqual(provider.kind, "chat")
+        self.assertEqual(FakeOpenAI.instances[-1].kwargs,
+                         {"api_key": "k", "base_url": pieni.DEEPSEEK_BASE_URL})
+        self.assertEqual(provider.complete([{"role": "user", "content": "hi"}]).text, "chat answer")
+
+    def test_openrouter_client_is_closed_through_its_context_manager(self):
+        provider = pieni.build_provider("openrouter", "vendor/model", {"OPENROUTER_API_KEY": "k"})
+        client = FakeOpenRouter.instances[-1]
+        self.assertTrue(client.entered)
+        self.assertEqual(client.api_key, "k")
+        reply = provider.complete([{"role": "user", "content": "hi"}])
+        self.assertEqual(reply.text, "openrouter answer")
+        self.assertEqual(client.requests[0]["model"], "vendor/model")
+        provider.close()
+        self.assertTrue(client.exited)
+        provider.close()  # closing twice must stay harmless
+
+    def test_custom_base_url_needs_no_key(self):
+        provider = pieni.build_provider("http://localhost:30000", "qwen", {})
+        self.assertEqual(provider.kind, "custom")
+        self.assertEqual(FakeOpenAI.instances[-1].kwargs,
+                         {"api_key": "not-needed", "base_url": "http://localhost:30000"})
+
+    def test_custom_base_url_uses_the_key_when_given(self):
+        pieni.build_provider("http://localhost:30000", "qwen", {"OPENAI_API_KEY": "k"})
+        self.assertEqual(FakeOpenAI.instances[-1].kwargs.get("api_key"), "k")
+
+    def test_missing_model_is_reported(self):
+        with self.assertRaises(pieni.ConfigError):
+            pieni.build_provider("openai", "", {"OPENAI_API_KEY": "k"})
+
+    def test_unknown_provider_is_reported(self):
+        with self.assertRaises(pieni.ConfigError):
+            pieni.build_provider("gemini", "m", {"OPENAI_API_KEY": "k"})
+
+    def test_missing_dependency_is_reported(self):
+        with mock.patch.dict(sys.modules, {"openai": None}):
+            with self.assertRaises(pieni.ConfigError) as caught:
+                pieni.build_provider("openai", "m", {"OPENAI_API_KEY": "k"})
+        self.assertIn("pip install -r requirements.txt", str(caught.exception))
+
+    def test_client_construction_failure_is_wrapped(self):
+        broken = mock.Mock(side_effect=ValueError("bad base url"))
+        with mock.patch.dict(sys.modules, {"openai": SimpleNamespace(OpenAI=broken)}):
+            with self.assertRaises(pieni.ProviderError) as caught:
+                pieni.build_provider("deepseek", "m", {"DEEPSEEK_API_KEY": "k"})
+        self.assertIn("bad base url", str(caught.exception))
+
+
+# ---------------------------------------------------------------------------
+# Permissions and the destructive-command guard
+# ---------------------------------------------------------------------------
+
+class GuardTests(unittest.TestCase):
+
+    FLAGGED = [
+        "rm -rf /tmp/data",
+        "sudo rm -fr build/",
+        "mkfs.ext4 /dev/sdb1",
+        "dd if=/dev/zero of=/dev/sda",
+        "shutdown -h now",
+        "git push --force origin main",
+        "git push -f",
+        "> /dev/sda",
+        "psql -c 'DROP TABLE users'",
+        "TRUNCATE TABLE logs",
+        "DELETE FROM users",
+        ":(){ :|:& };:",
+    ]
+
+    ALLOWED = [
+        "ls -la",
+        "rm notes.txt",
+        "git push origin main",
+        "python3 -m unittest test_pieni",
+        "grep -r TODO .",
+        "dd --version",
+        "echo 'drop the table later'",
+        "cat /dev/null",
+        "SELECT * FROM users WHERE id = 1",
+    ]
+
+    def test_flagged_commands(self):
+        for command in self.FLAGGED:
+            with self.subTest(command=command):
+                self.assertIsNotNone(pieni.dcg_reason(command), "should be flagged")
+
+    def test_ordinary_commands_are_not_flagged(self):
+        for command in self.ALLOWED:
+            with self.subTest(command=command):
+                self.assertIsNone(pieni.dcg_reason(command), "should not be flagged")
+
+
+class PermissionTests(TempWorkspaceCase):
+
+    def test_auto_allows_ordinary_commands_without_asking(self):
+        asked = []
+        permissions = self.permissions(approve=lambda *args: asked.append(args) or True)
+        allowed, reason = permissions.check_shell("ls -la")
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "")
+        self.assertEqual(asked, [])
+
+    def test_auto_asks_about_flagged_commands(self):
+        asked = []
+        permissions = self.permissions(approve=lambda *args: asked.append(args) or True)
+        allowed, _ = permissions.check_shell("rm -rf build")
+        self.assertTrue(allowed)
+        self.assertEqual(asked[0][0], "shell")
+        self.assertIn("destructive command guard", asked[0][2])
+
+    def test_refused_flagged_command_is_denied(self):
+        permissions = self.permissions(approve=lambda *args: False)
+        allowed, reason = permissions.check_shell("rm -rf build")
+        self.assertFalse(allowed)
+        self.assertIn("denied by the user", reason)
+
+    def test_headless_denies_instead_of_waiting(self):
+        permissions = self.permissions(approve=None)
+        allowed, reason = permissions.check_shell("rm -rf build")
+        self.assertFalse(allowed)
+        self.assertIn("headless", reason)
+
+    def test_yolo_skips_the_guard_and_approval(self):
+        permissions = self.permissions(mode="yolo", approve=None)
+        self.assertEqual(permissions.check_shell("rm -rf /"), (True, ""))
+
+    def test_workspace_and_temp_paths_are_allowed(self):
+        permissions = self.permissions()
+        workspace_file = self.workspace / "notes.txt"
+        self.assertEqual(permissions.check_file(workspace_file, "write"), (True, ""))
+        temp_file = self.root / "tmp" / "scratch.txt"
+        self.assertEqual(permissions.check_file(temp_file, "write"), (True, ""))
+
+    def test_outside_paths_need_approval(self):
+        permissions = self.permissions(approve=None)
+        allowed, reason = permissions.check_file(self.root / "outside.txt", "write")
+        self.assertFalse(allowed)
+        self.assertIn("outside the workspace", reason)
+
+    def test_path_resolution_follows_parents_and_symlinks(self):
+        self.assertEqual(pieni.resolve_path(self.workspace, "sub/../file.txt"),
+                         self.workspace / "file.txt")
+        outside = self.write(self.root / "outside.txt", "secret")
+        link = self.workspace / "link.txt"
+        link.symlink_to(outside)
+        self.assertEqual(pieni.resolve_path(self.workspace, "link.txt"), outside.resolve())
+        permissions = self.permissions(approve=None)
+        self.assertFalse(permissions.check_file(pieni.resolve_path(self.workspace, "link.txt"), "read")[0])
+
+    def test_absolute_path_inside_the_workspace_is_allowed(self):
+        permissions = self.permissions()
+        self.assertEqual(permissions.check_file(self.workspace / "a.txt", "read"), (True, ""))
+
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+
+class ReadToolTests(TempWorkspaceCase):
+
+    def test_reads_a_whole_file(self):
+        self.write(self.workspace / "notes.txt", "first\nsecond\n")
+        outcome = self.toolbox().run("read", {"path": "notes.txt"})
+        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome.detail, "")
+        self.assertIn("lines 1-2 of 2", outcome.output)
+        self.assertIn("first\nsecond", outcome.output)
+
+    def test_reads_a_line_range(self):
+        self.write(self.workspace / "notes.txt", "one\ntwo\nthree\nfour\n")
+        outcome = self.toolbox().run("read", {"path": "notes.txt", "start_line": 2, "end_line": 3})
+        self.assertTrue(outcome.ok)
+        self.assertIn("two\nthree", outcome.output)
+        self.assertNotIn("one", outcome.output)
+        self.assertNotIn("four", outcome.output)
+
+    def test_missing_file_is_an_error(self):
+        outcome = self.toolbox().run("read", {"path": "missing.txt"})
+        self.assertFalse(outcome.ok)
+        self.assertIn("FileNotFoundError", outcome.detail)
+
+    def test_directory_is_an_error(self):
+        (self.workspace / "folder").mkdir()
+        outcome = self.toolbox().run("read", {"path": "folder"})
+        self.assertFalse(outcome.ok)
+
+    def test_invalid_range_is_an_error(self):
+        self.write(self.workspace / "notes.txt", "one\n")
+        outcome = self.toolbox().run("read", {"path": "notes.txt", "start_line": 3})
+        self.assertFalse(outcome.ok)
+        self.assertIn("invalid line range", outcome.detail)
+
+    def test_malformed_arguments_are_rejected(self):
+        for arguments in ({"path": 5}, {"path": ""}, {}, {"path": "a", "bogus": 1}):
+            with self.subTest(arguments=arguments):
+                outcome = self.toolbox().run("read", arguments)
+                self.assertFalse(outcome.ok)
+                self.assertTrue(outcome.output.startswith("error:"))
+
+    def test_unicode_and_rtl_text(self):
+        text = "中文文本\nمرحبا بالعالم\n"
+        self.write(self.workspace / "unicode.txt", text)
+        outcome = self.toolbox().run("read", {"path": "unicode.txt"})
+        self.assertTrue(outcome.ok)
+        self.assertIn("中文文本", outcome.output)
+        self.assertIn("مرحبا بالعالم", outcome.output)
+
+    def test_binary_file_is_reported(self):
+        (self.workspace / "data.bin").write_bytes(b"\xff\xfe\x00\x01")
+        outcome = self.toolbox().run("read", {"path": "data.bin"})
+        self.assertFalse(outcome.ok)
+        self.assertIn("UnicodeDecodeError", outcome.detail)
+
+    def test_long_file_is_truncated(self):
+        self.write(self.workspace / "big.txt", "".join(f"line {n}\n" for n in range(1000)))
+        outcome = self.toolbox().run("read", {"path": "big.txt"})
+        self.assertTrue(outcome.ok)
+        self.assertIn(f"first {pieni.MAX_READ_LINES}", outcome.output)
+        self.assertLess(len(outcome.output), pieni.MAX_OUTPUT_CHARS + 200)
+
+    def test_outside_path_is_denied_in_headless_use(self):
+        outside = self.write(self.root / "outside.txt", "secret")
+        outcome = self.toolbox(approve=None).run("read", {"path": "../outside.txt"})
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.detail, "denied")
+        self.assertNotIn("secret", outcome.output)
+        self.assertTrue(outside.exists())
+
+    def test_outside_path_is_allowed_after_approval(self):
+        outside = self.write(self.root / "outside.txt", "secret")
+        outcome = self.toolbox(approve=self.allow_all()).run("read", {"path": "../outside.txt"})
+        self.assertTrue(outcome.ok)
+        self.assertIn("secret", outcome.output)
+
+    def test_temporary_directory_is_allowed(self):
+        scratch = self.write(self.root / "tmp" / "scratch.txt", "scratch")
+        outcome = self.toolbox(approve=None).run("read", {"path": str(scratch)})
+        self.assertTrue(outcome.ok)
+
+
+class WriteToolTests(TempWorkspaceCase):
+
+    def test_creates_and_replaces_a_file(self):
+        toolbox = self.toolbox()
+        first = toolbox.run("write", {"path": "new/notes.txt", "content": "hello\n"})
+        self.assertTrue(first.ok)
+        self.assertIn("created", first.output)
+        self.assertEqual((self.workspace / "new" / "notes.txt").read_text(encoding="utf-8"), "hello\n")
+        second = toolbox.run("write", {"path": "new/notes.txt", "content": "changed\n"})
+        self.assertIn("replaced", second.output)
+        self.assertEqual((self.workspace / "new" / "notes.txt").read_text(encoding="utf-8"), "changed\n")
+
+    def test_empty_content_is_allowed(self):
+        outcome = self.toolbox().run("write", {"path": "empty.txt", "content": ""})
+        self.assertTrue(outcome.ok)
+        self.assertEqual((self.workspace / "empty.txt").read_text(encoding="utf-8"), "")
+
+    def test_missing_content_is_rejected(self):
+        outcome = self.toolbox().run("write", {"path": "a.txt"})
+        self.assertFalse(outcome.ok)
+        self.assertIn("content", outcome.detail)
+
+    def test_unicode_content_round_trip(self):
+        outcome = self.toolbox().run("write", {"path": "u.txt", "content": "日本語\nاقرأ\n"})
+        self.assertTrue(outcome.ok)
+        self.assertEqual((self.workspace / "u.txt").read_text(encoding="utf-8"), "日本語\nاقرأ\n")
+
+    def test_outside_write_needs_approval(self):
+        outcome = self.toolbox(approve=None).run("write", {"path": "../escape.txt", "content": "x"})
+        self.assertFalse(outcome.ok)
+        self.assertFalse((self.root / "escape.txt").exists())
+
+    def test_yolo_allows_outside_write(self):
+        outcome = self.toolbox(mode="yolo").run("write", {"path": "../escape.txt", "content": "x"})
+        self.assertTrue(outcome.ok)
+        self.assertEqual((self.root / "escape.txt").read_text(encoding="utf-8"), "x")
+
+
+class EditToolTests(TempWorkspaceCase):
+
+    def setUp(self):
+        super().setUp()
+        self.path = self.write(self.workspace / "code.py", "value = 1\nother = 2\n")
+
+    def test_replaces_one_match(self):
+        outcome = self.toolbox().run("edit", {"path": "code.py", "old_text": "value = 1",
+                                              "new_text": "value = 42"})
+        self.assertTrue(outcome.ok)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), "value = 42\nother = 2\n")
+
+    def test_missing_text_is_an_error(self):
+        outcome = self.toolbox().run("edit", {"path": "code.py", "old_text": "absent",
+                                              "new_text": "x"})
+        self.assertFalse(outcome.ok)
+        self.assertIn("not found", outcome.detail)
+
+    def test_ambiguous_text_is_an_error(self):
+        self.write(self.path, "x = 1\nx = 1\n")
+        outcome = self.toolbox().run("edit", {"path": "code.py", "old_text": "x = 1",
+                                              "new_text": "x = 2"})
+        self.assertFalse(outcome.ok)
+        self.assertIn("matches 2 times", outcome.detail)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), "x = 1\nx = 1\n")
+
+    def test_empty_old_text_is_an_error(self):
+        outcome = self.toolbox().run("edit", {"path": "code.py", "old_text": "", "new_text": "x"})
+        self.assertFalse(outcome.ok)
+
+    def test_unicode_edit(self):
+        self.write(self.path, "greeting = \"hei\"\n")
+        outcome = self.toolbox().run("edit", {"path": "code.py", "old_text": "hei",
+                                              "new_text": "moi 世界"})
+        self.assertTrue(outcome.ok)
+        self.assertIn("世界", self.path.read_text(encoding="utf-8"))
+
+
+class BashToolTests(TempWorkspaceCase):
+
+    def test_runs_a_command_in_the_workspace(self):
+        outcome = self.toolbox().run("bash", {"command": "pwd"})
+        self.assertTrue(outcome.ok)
+        self.assertIn(str(self.workspace), outcome.output)
+
+    def test_captures_stderr_and_exit_code(self):
+        outcome = self.toolbox().run("bash", {"command": "echo boom >&2; exit 3"})
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.detail, "exit code 3")
+        self.assertIn("boom", outcome.output)
+        self.assertIn("exit code 3", outcome.output)
+
+    def test_timeout_is_reported(self):
+        outcome = self.toolbox().run("bash", {"command": "sleep 5", "timeout": 1})
+        self.assertFalse(outcome.ok)
+        self.assertIn("timeout", outcome.detail)
+
+    def test_empty_output_is_marked(self):
+        outcome = self.toolbox().run("bash", {"command": "true"})
+        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome.output, "(no output)")
+
+    def test_invalid_timeout_and_command(self):
+        for arguments in ({"command": ""}, {}, {"command": "ls", "timeout": 0},
+                          {"command": "ls", "timeout": 9999}, {"command": 5}):
+            with self.subTest(arguments=arguments):
+                self.assertFalse(self.toolbox().run("bash", arguments).ok)
+
+    def test_flagged_command_is_denied_when_not_approved(self):
+        outcome = self.toolbox(approve=lambda *args: False).run("bash", {"command": "rm -rf build"})
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.detail, "denied")
+
+    def test_flagged_command_runs_after_approval(self):
+        outcome = self.toolbox(approve=self.allow_all()).run("bash", {"command": "rm -rf build"})
+        self.assertTrue(outcome.ok)  # nothing to delete, but it ran
+
+    def test_output_is_bounded(self):
+        outcome = self.toolbox().run("bash", {"command": "yes x | head -c 30000"})
+        self.assertTrue(outcome.ok)
+        self.assertLess(len(outcome.output), pieni.MAX_OUTPUT_CHARS + 200)
+        self.assertIn("truncated", outcome.output)
+
+    def test_non_utf8_output_is_not_fatal(self):
+        outcome = self.toolbox().run("bash", {"command": "printf '\\xff\\xfehello'"})
+        self.assertTrue(outcome.ok)
+        self.assertIn("hello", outcome.output)
+
+    def test_unknown_tool_name(self):
+        outcome = self.toolbox().run("delete_everything", {})
+        self.assertFalse(outcome.ok)
+        self.assertIn("unknown tool", outcome.detail)
+
+
+class ToolArgumentTests(unittest.TestCase):
+
+    def test_parses_json_arguments(self):
+        self.assertEqual(pieni.parse_tool_arguments('{"a": 1}'), {"a": 1})
+        self.assertEqual(pieni.parse_tool_arguments(""), {})
+        self.assertEqual(pieni.parse_tool_arguments({"a": 1}), {"a": 1})
+
+    def test_rejects_invalid_json(self):
+        for raw in ("{not json", "[1, 2]", "5"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(pieni.PieniError):
+                    pieni.parse_tool_arguments(raw)
+
+
+# ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+
+class StoreTests(TempWorkspaceCase):
+
+    def test_saves_and_resumes_the_active_context(self):
+        store = pieni.Store(self.root / "db" / "pieni.db")
+        self.addCleanup(store.close)
+        session = store.start_session("openai", "gpt-x", str(self.workspace))
+        store.add_message(session, {"role": "user", "content": "中文 ❤"})
+        store.add_message(session, {"role": "assistant", "content": "ok"})
+        session_id, messages = store.resume("openai", "gpt-x", str(self.workspace))
+        self.assertEqual(session_id, session)
+        self.assertEqual([m["content"] for m in messages], ["中文 ❤", "ok"])
+
+    def test_resume_is_scoped_to_provider_model_and_workspace(self):
+        store = pieni.Store(self.root / "pieni.db")
+        self.addCleanup(store.close)
+        store.start_session("openai", "gpt-x", str(self.workspace))
+        self.assertIsNone(store.resume("openai", "other", str(self.workspace))[0])
+        self.assertIsNone(store.resume("deepseek", "gpt-x", str(self.workspace))[0])
+        self.assertIsNone(store.resume("openai", "gpt-x", str(self.root))[0])
+
+    def test_resume_returns_the_latest_session(self):
+        store = pieni.Store(self.root / "pieni.db")
+        self.addCleanup(store.close)
+        first = store.start_session("openai", "gpt-x", str(self.workspace))
+        store.add_message(first, {"role": "user", "content": "old"})
+        second = store.start_session("openai", "gpt-x", str(self.workspace))
+        store.add_message(second, {"role": "user", "content": "new"})
+        session_id, messages = store.resume("openai", "gpt-x", str(self.workspace))
+        self.assertEqual(session_id, second)
+        self.assertEqual(messages, [{"role": "user", "content": "new"}])
+
+    def test_inactive_messages_are_only_logs(self):
+        store = pieni.Store(self.root / "pieni.db")
+        self.addCleanup(store.close)
+        session = store.start_session("openai", "gpt-x", str(self.workspace))
+        first = store.add_message(session, {"role": "user", "content": "old"})
+        store.add_message(session, {"role": "user", "content": "new"})
+        self.assertEqual(store.last_message_id(session), first + 1)
+        store.deactivate(session, first)
+        self.assertEqual(store.last_message_id(session), first + 1)
+        rows = store.execute("SELECT COUNT(*) AS total FROM messages").fetchone()
+        self.assertEqual(rows["total"], 2)  # logs stay in the database
+
+    def test_empty_session_has_no_messages(self):
+        store = pieni.Store(self.root / "pieni.db")
+        self.addCleanup(store.close)
+        session = store.start_session("openai", "gpt-x", str(self.workspace))
+        self.assertIsNone(store.last_message_id(session))
+        self.assertEqual(store.resume("openai", "gpt-x", str(self.workspace))[1], [])
+
+    def test_corrupt_payload_is_reported(self):
+        store = pieni.Store(self.root / "pieni.db")
+        self.addCleanup(store.close)
+        session = store.start_session("openai", "gpt-x", str(self.workspace))
+        store.connection.execute(
+            "INSERT INTO messages (session_id, active, role, payload, created_at) "
+            "VALUES (?, 1, 'user', 'not json', 'now')", (session,))
+        with self.assertRaises(pieni.PieniError):
+            store.resume("openai", "gpt-x", str(self.workspace))
+
+    def test_unusable_database_path_is_reported(self):
+        with self.assertRaises(pieni.PieniError) as caught:
+            pieni.Store(self.workspace)  # a directory, not a file
+        self.assertIn("cannot open the database", str(caught.exception))
+
+
+# ---------------------------------------------------------------------------
+# Agent loop
+# ---------------------------------------------------------------------------
+
+class AgentLoopTests(TempWorkspaceCase):
+
+    def test_task_with_a_tool_call_then_an_answer(self):
+        agent, provider, _, output = self.make_agent([
+            reply_from([("call_1", "write", '{"path": "notes.txt", "content": "hi"}')]),
+            reply_from(text="all done"),
+        ])
+        self.assertTrue(agent.run_task("write notes.txt"))
+        self.assertEqual((self.workspace / "notes.txt").read_text(encoding="utf-8"), "hi")
+        self.assertIn("all done", output)
+        tool_line = next(line for line in output if line.startswith("write("))
+        self.assertIn("-> ok,", tool_line)
+        self.assertRegex(tool_line, r"-> ok, \d+ ms$")
+        self.assertTrue(output[-1].startswith("Tokens: "))
+        # The tool result goes back to the model with its call id.
+        follow_up = provider.requests[1][-1]
+        self.assertEqual(follow_up["role"], "tool")
+        self.assertEqual(follow_up["tool_call_id"], "call_1")
+        self.assertIn("created notes.txt", follow_up["content"])
+
+    def test_task_without_tool_calls_answers_directly(self):
+        agent, provider, _, output = self.make_agent([reply_from(text="hello")])
+        self.assertTrue(agent.run_task("hi"))
+        self.assertEqual(len(provider.requests), 1)
+        self.assertEqual(provider.requests[0][0], {"role": "system", "content": "test instructions"})
+        self.assertIn("hello", output)
+
+    def test_failing_tool_is_reported_and_the_loop_continues(self):
+        agent, provider, _, output = self.make_agent([
+            reply_from([("call_1", "read", '{"path": "missing.txt"}')]),
+            reply_from(text="could not read it"),
+        ])
+        self.assertTrue(agent.run_task("read missing.txt"))
+        line = next(line for line in output if line.startswith("read("))
+        self.assertIn("-> error:", line)
+        self.assertIn("error:", provider.requests[1][-1]["content"])
+
+    def test_invalid_tool_arguments_are_reported(self):
+        agent, _, _, output = self.make_agent([
+            reply_from([("call_1", "read", "{not json")]),
+            reply_from(text="sorry"),
+        ])
+        self.assertTrue(agent.run_task("read"))
+        line = next(line for line in output if line.startswith("read("))
+        self.assertIn("not valid JSON", line)
+
+    def test_provider_error_ends_the_task_with_a_summary(self):
+        agent, _, _, output = self.make_agent([pieni.ProviderError("boom")])
+        self.assertFalse(agent.run_task("hi"))
+        self.assertIn("error: boom", output)
+        self.assertTrue(output[-1].startswith("Tokens: "))
+
+    def test_missing_provider_usage_is_marked_as_estimated(self):
+        agent, _, _, output = self.make_agent([
+            reply_from([("call_1", "read", '{"path": "a.txt"}')]),
+            pieni.Reply("done", [], 900, 100, True),
+        ])
+        agent.run_task("go")
+        self.assertTrue(output[-1].startswith("Tokens: ~"), output[-1])
+
+    def test_loop_stops_after_the_step_limit(self):
+        calls = [("call_%d" % n, "read", '{"path": "missing.txt"}') for n in range(pieni.MAX_STEPS)]
+        agent, _, _, output = self.make_agent([reply_from([call]) for call in calls])
+        self.assertFalse(agent.run_task("loop forever"))
+        self.assertIn(f"stopped after {pieni.MAX_STEPS} tool rounds", output[-2])
+
+    def test_interruption_during_a_tool_call_keeps_the_context_valid(self):
+        agent, _, store, output = self.make_agent([reply_from([
+            ("call_1", "read", '{"path": "a.txt"}'),
+            ("call_2", "read", '{"path": "b.txt"}'),
+        ])])
+
+        class Interrupting:
+            def run(self, name, arguments):
+                raise KeyboardInterrupt
+
+        agent.tools = Interrupting()
+        self.assertFalse(agent.run_task("interrupt me"))
+        self.assertIn("interrupted", output)
+        self.assertTrue(output[-1].startswith("Tokens: "))
+        stored = store.resume("scripted", "scripted-model", str(self.workspace))[1]
+        tool_messages = [message for message in stored if message["role"] == "tool"]
+        self.assertEqual([message["tool_call_id"] for message in tool_messages], ["call_1", "call_2"])
+        self.assertIn("interrupted", tool_messages[0]["content"])
+
+    def test_interruption_during_a_model_call(self):
+        agent, _, _, output = self.make_agent([KeyboardInterrupt()])
+        self.assertFalse(agent.run_task("interrupt me"))
+        self.assertIn("interrupted", output)
+        self.assertTrue(output[-1].startswith("Tokens: "))
+
+    def test_resume_does_not_repeat_tool_calls(self):
+        store = pieni.Store(self.root / "pieni.db")
+        self.addCleanup(store.close)
+        agent, _, _, _ = self.make_agent([
+            reply_from([("call_1", "write", '{"path": "made.txt", "content": "once"}')]),
+            reply_from(text="done"),
+        ], store=store)
+        self.assertTrue(agent.run_task("create made.txt"))
+        (self.workspace / "made.txt").unlink()
+
+        session, messages = store.resume("scripted", "scripted-model", str(self.workspace))
+        resumed, provider, _, _ = self.make_agent([reply_from(text="still here")],
+                                                  messages=messages, store=store)
+        resumed.session_id = session
+        self.assertTrue(resumed.run_task("what did you do?"))
+        self.assertFalse((self.workspace / "made.txt").exists())  # nothing re-executed
+        first_request = provider.requests[0]
+        self.assertEqual([message["role"] for message in first_request],
+                         ["system", "user", "assistant", "tool", "assistant", "user"])
+        self.assertEqual(first_request[3]["tool_call_id"], "call_1")
+
+    def test_context_usage_grows_with_the_conversation(self):
+        agent, _, _, _ = self.make_agent([reply_from(text="ok")])
+        before = agent.context_tokens()
+        agent.messages.append({"role": "user", "content": "x" * 400})
+        self.assertGreater(agent.context_tokens(), before)
+
+
+class AgentCommandTests(TempWorkspaceCase):
+
+    def test_quit_and_exit_stop_the_session(self):
+        agent, _, _, _ = self.make_agent([])
+        self.assertFalse(agent.handle_command("/quit"))
+        self.assertFalse(agent.handle_command("/exit"))
+
+    def test_help_lists_the_commands(self):
+        agent, _, _, output = self.make_agent([])
+        self.assertTrue(agent.handle_command("/help"))
+        self.assertIn("/compact", output[0])
+
+    def test_permissions_can_be_shown_and_changed(self):
+        agent, _, _, output = self.make_agent([])
+        agent.handle_command("/permissions")
+        self.assertEqual(output[0], "permissions: auto")
+        agent.handle_command("/permissions yolo")
+        self.assertEqual(agent.permissions.mode, "yolo")
+        self.assertIn("warning", output[2])
+        agent.handle_command("/permissions maybe")
+        self.assertIn("permissions must be", output[3])
+        self.assertEqual(agent.permissions.mode, "yolo")
+
+    def test_unknown_command_is_reported(self):
+        agent, _, _, output = self.make_agent([])
+        self.assertTrue(agent.handle_command("/nope"))
+        self.assertIn("unknown command", output[0])
+
+    def test_compact_replaces_older_context(self):
+        agent, provider, store, output = self.make_agent([reply_from(text="short summary")])
+        agent.remember({"role": "user", "content": "old work"})
+        self.assertTrue(agent.handle_command("/compact"))
+        self.assertEqual(len(agent.messages), 1)
+        self.assertIn("short summary", agent.messages[0]["content"])
+        self.assertIn("compacted", output[-1])
+        # The summary request carries the whole context and no tool schema.
+        self.assertIn(pieni.COMPACT_INSTRUCTION, provider.requests[-1][-1]["content"])
+        stored = store.resume("scripted", "scripted-model", str(self.workspace))[1]
+        self.assertEqual(len(stored), 1)
+
+    def test_compaction_failure_keeps_the_context(self):
+        agent, _, _, output = self.make_agent([pieni.ProviderError("nope")])
+        agent.remember({"role": "user", "content": "keep me"})
+        before = list(agent.messages)
+        self.assertFalse(agent.compact())
+        self.assertEqual(agent.messages, before)
+        self.assertIn("unchanged", output[-1])
+
+    def test_compaction_without_a_summary_keeps_the_context(self):
+        agent, _, _, output = self.make_agent([reply_from(text="   ")])
+        agent.remember({"role": "user", "content": "keep me"})
+        before = list(agent.messages)
+        self.assertFalse(agent.compact())
+        self.assertEqual(agent.messages, before)
+        self.assertIn("no summary", output[-1])
+
+    def test_compact_all_starts_a_fresh_session(self):
+        agent, _, store, output = self.make_agent([])
+        agent.remember({"role": "user", "content": "old work"})
+        old_session = agent.session_id
+        self.assertTrue(agent.handle_command("/compact all"))
+        self.assertEqual(agent.messages, [])
+        self.assertNotEqual(agent.session_id, old_session)
+        self.assertEqual(store.resume("scripted", "scripted-model", str(self.workspace))[1], [])
+        self.assertIn("cleared the context", output[-1])
+
+    def test_compact_with_an_argument_is_a_usage_error(self):
+        agent, _, _, output = self.make_agent([])
+        agent.handle_command("/compact now")
+        self.assertIn("usage: /compact", output[-1])
+
+    def test_compact_without_context_says_so(self):
+        agent, _, _, output = self.make_agent([])
+        agent.handle_command("/compact")
+        self.assertIn("nothing to compact", output[-1])
+
+
+# ---------------------------------------------------------------------------
+# Display
+# ---------------------------------------------------------------------------
+
+class DisplayTests(unittest.TestCase):
+
+    def test_tool_status_line_for_success(self):
+        self.assertEqual(pieni.format_tool_call("read", {"path": "pieni.py"}, True, "", 12),
+                         'read(path="pieni.py") -> ok, 12 ms')
+
+    def test_tool_status_line_for_failure(self):
+        self.assertEqual(
+            pieni.format_tool_call("bash", {"command": "false"}, False, "exit code 1", 5),
+            'bash(command="false") -> error: exit code 1, 5 ms')
+
+    def test_long_arguments_are_shortened(self):
+        line = pieni.format_tool_call("write", {"path": "a", "content": "x" * 500}, True, "", 1)
+        self.assertLess(len(line), 200)
+        self.assertIn("...", line)
+
+    def test_unparsed_arguments_are_shown_as_text(self):
+        line = pieni.format_tool_call("read", "{not json", False, "bad", 3)
+        self.assertIn("{not json", line)
+
+    def test_task_summary_with_provider_usage(self):
+        usage = pieni.TaskUsage()
+        usage.record(2000, 400, False)
+        usage.elapsed_seconds = 3.14
+        self.assertEqual(usage.line(12000),
+                         "Tokens: 2,400 | Context: ~12,000 / 1,000,000 (1.2%) | 3.1 seconds")
+
+    def test_task_summary_marks_estimates(self):
+        usage = pieni.TaskUsage()
+        usage.record(2000, 400, True)
+        usage.elapsed_seconds = 0.04
+        self.assertEqual(usage.line(0),
+                         "Tokens: ~2,400 | Context: ~0 / 1,000,000 (0.0%) | 0.0 seconds")
+        self.assertEqual(usage.total_tokens, 2400)
+
+    def test_token_estimate_and_truncation_helpers(self):
+        self.assertEqual(pieni.estimate_tokens(""), 0)
+        self.assertEqual(pieni.estimate_tokens("abcd"), 1)
+        self.assertEqual(pieni.truncate("abcdef", limit=3), "abc\n...[truncated 3 characters]")
+
+
+# ---------------------------------------------------------------------------
+# Command line
+# ---------------------------------------------------------------------------
+
+class ScriptedFakeOpenAI:
+    """Fake openai SDK client driven by a class-level script of replies."""
+
+    script = []
+    instances = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.requests = []
+        self.responses = SimpleNamespace(create=self.create)
+        type(self).instances.append(self)
+
+    def create(self, **kwargs):
+        self.requests.append(kwargs)
+        reply = type(self).script.pop(0)
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
+
+
+class CliTests(TempWorkspaceCase):
+
+    def setUp(self):
+        super().setUp()
+        self.in_directory(self.workspace)
+
+    def isolate_config(self):
+        return mock.patch("pieni.config_paths",
+                          return_value=[self.home / "nope.ini", self.workspace / "nope.ini"])
+
+    def test_parse_args(self):
+        args = pieni.parse_args(["deepseek", "-m", "deepseek-chat", "-r", "hi",
+                                 "--permissions", "yolo"])
+        self.assertEqual((args.provider, args.model, args.run, args.permissions),
+                         ("deepseek", "deepseek-chat", "hi", "yolo"))
+        self.assertEqual(pieni.parse_args([]).permissions, None)
+        with redirect_stderr(StringIO()):
+            with self.assertRaises(SystemExit):
+                pieni.parse_args(["--permissions", "sometimes"])
+
+    def test_missing_provider_is_reported(self):
+        stderr = StringIO()
+        with self.isolate_config(), redirect_stderr(stderr):
+            code = pieni.main([])
+        self.assertEqual(code, 2)
+        self.assertIn("no provider set", stderr.getvalue())
+
+    def test_unknown_provider_is_reported(self):
+        stderr = StringIO()
+        with self.isolate_config(), redirect_stderr(stderr):
+            code = pieni.main(["gemini", "-m", "m"])
+        self.assertEqual(code, 2)
+        self.assertIn("unknown provider", stderr.getvalue())
+
+    def test_missing_key_is_reported(self):
+        stderr = StringIO()
+        with self.isolate_config(), redirect_stderr(stderr):
+            with mock.patch.dict(os.environ, {}, clear=True):
+                code = pieni.main(["openai", "-m", "gpt-x", "-r", "hi"])
+        self.assertEqual(code, 2)
+        self.assertIn("OPENAI_API_KEY", stderr.getvalue())
+
+    def test_empty_headless_prompt_is_rejected(self):
+        stderr = StringIO()
+        with self.isolate_config(), redirect_stderr(stderr), redirect_stdout(StringIO()):
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "k"}):
+                with mock.patch.dict(sys.modules, {"openai": SimpleNamespace(OpenAI=ScriptedFakeOpenAI)}):
+                    code = pieni.main(["openai", "-m", "gpt-x", "-r", "   "])
+        self.assertEqual(code, 2)
+        self.assertIn("non-empty prompt", stderr.getvalue())
+
+    def test_headless_run_and_resume(self):
+        ScriptedFakeOpenAI.script = [
+            responses_reply("", [("call_1", "write", '{"path": "new.txt", "content": "x"}')]),
+            responses_reply("finished the task"),
+        ]
+        ScriptedFakeOpenAI.instances = []
+        stdout = StringIO()
+        with self.isolate_config(), redirect_stdout(stdout):
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "k"}):
+                with mock.patch.dict(sys.modules, {"openai": SimpleNamespace(OpenAI=ScriptedFakeOpenAI)}):
+                    code = pieni.main(["openai", "-m", "gpt-x", "-r", "create new.txt"])
+        self.assertEqual(code, 0)
+        text = stdout.getvalue()
+        self.assertIn("new session with openai/gpt-x", text)
+        self.assertIn("permissions: auto", text)
+        self.assertRegex(text, r'write\(path="new\.txt", content="x"\) -> ok, \d+ ms')
+        self.assertIn("finished the task", text)
+        self.assertRegex(text, r"Tokens: \d[\d,]* \| Context: ~[\d,]+ / 1,000,000 \(\d+\.\d%\) \| \d+\.\d seconds")
+        self.assertEqual((self.workspace / "new.txt").read_text(encoding="utf-8"), "x")
+        self.assertTrue((self.workspace / ".pieni" / "pieni.db").is_file())
+        # The tool result reached the provider with its call id.
+        self.assertEqual(ScriptedFakeOpenAI.instances[-1].requests[1]["input"][-1]["type"],
+                         "function_call_output")
+
+        ScriptedFakeOpenAI.script = [responses_reply("resumed answer")]
+        stdout = StringIO()
+        with self.isolate_config(), redirect_stdout(stdout):
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "k"}):
+                with mock.patch.dict(sys.modules, {"openai": SimpleNamespace(OpenAI=ScriptedFakeOpenAI)}):
+                    code = pieni.main(["openai", "-m", "gpt-x", "-r", "continue"])
+        self.assertEqual(code, 0)
+        self.assertIn("resumed a session with 4 message(s)", stdout.getvalue())
+
+    def test_headless_provider_failure_exits_nonzero(self):
+        ScriptedFakeOpenAI.script = [RuntimeError("connection reset")]
+        stdout = StringIO()
+        with self.isolate_config(), redirect_stdout(stdout):
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "k"}):
+                with mock.patch.dict(sys.modules, {"openai": SimpleNamespace(OpenAI=ScriptedFakeOpenAI)}):
+                    code = pieni.main(["openai", "-m", "gpt-x", "-r", "go"])
+        self.assertEqual(code, 1)
+        self.assertIn("error: openai request failed", stdout.getvalue())
+        self.assertIn("Tokens:", stdout.getvalue())
+
+    def test_interactive_loop_runs_a_task_and_quits(self):
+        agent, _, _, output = self.make_agent([reply_from(text="hello")])
+        stdout = StringIO()
+        with mock.patch("builtins.input", side_effect=["do something", "/quit"]):
+            with redirect_stdout(stdout):
+                self.assertEqual(pieni.run_interactive(agent), 0)
+        self.assertIn("hello", output)
+        self.assertIn("bye", output)
+        self.assertIn("Type a task", stdout.getvalue())
+
+    def test_interactive_loop_exits_on_end_of_input(self):
+        agent, _, _, _ = self.make_agent([])
+        stdout = StringIO()
+        with mock.patch("builtins.input", side_effect=EOFError):
+            with redirect_stdout(stdout):
+                self.assertEqual(pieni.run_interactive(agent), 0)
+
+    def test_cli_approve_reads_the_answer(self):
+        stdout = StringIO()
+        with mock.patch("builtins.input", return_value="y"), redirect_stdout(stdout):
+            self.assertTrue(pieni.cli_approve("shell", "rm -rf build", "guard"))
+        with mock.patch("builtins.input", return_value="n"), redirect_stdout(StringIO()):
+            self.assertFalse(pieni.cli_approve("shell", "rm -rf build", "guard"))
+        self.assertIn("[approval needed]", stdout.getvalue())
+
+
+class LauncherTests(unittest.TestCase):
+    """The Bash launcher runs pieni.py, preferring the project virtualenv."""
+
+    def setUp(self):
+        if not Path("/usr/bin/env").exists():
+            self.skipTest("needs a POSIX shell")
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.root = Path(self.tempdir.name)
+        self.marker = self.root / "marker.txt"
+        source = Path(pieni.__file__).with_name("pieni")
+        if not source.exists():
+            self.skipTest("the launcher is not next to pieni.py")
+        self.launcher = self.root / "pieni"
+        self.launcher.write_bytes(source.read_bytes())
+        self.launcher.chmod(0o755)
+        # A stub agent records its arguments, so the test stays unaware of the CLI.
+        self.write_stub(self.root / "pieni.py",
+                        'import sys\n'
+                        f'open({str(self.marker)!r}, "a", encoding="utf-8").write("args=" + " " .join(sys.argv[1:]) + "\\n")\n')
+
+    def write_stub(self, path, body, mode=0o755):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        path.chmod(mode)
+
+    def stub_interpreter(self, name):
+        """An interpreter stub that records its own path, then runs the real Python."""
+        path = self.root / name
+        self.write_stub(
+            path,
+            "#!/usr/bin/env bash\n"
+            f'printf "interpreter=%s\\n" "$0" >> {str(self.marker)!r}\n'
+            f'exec {sys.executable!r} "$@"\n')
+        return path
+
+    def run_launcher(self, *arguments, path=None, cwd=None):
+        environment = dict(os.environ)
+        if path is not None:
+            environment["PATH"] = f"{path}{os.pathsep}{environment['PATH']}"
+        completed = subprocess.run([str(self.launcher), *arguments], capture_output=True,
+                                   text=True, env=environment, cwd=cwd, timeout=60)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return self.marker.read_text(encoding="utf-8").splitlines()
+
+    def test_uses_the_project_virtualenv_when_it_exists(self):
+        interpreter = self.stub_interpreter(".venv/bin/python")
+        lines = self.run_launcher("--permissions", "yolo")
+        self.assertEqual(lines, [f"interpreter={interpreter}", "args=--permissions yolo"])
+
+    def test_falls_back_to_python3_on_the_path(self):
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        interpreter = self.stub_interpreter("bin/python3")
+        lines = self.run_launcher("openai", "-m", "gpt-x", path=bin_dir)
+        self.assertEqual(lines, [f"interpreter={interpreter}", "args=openai -m gpt-x"])
+
+    def test_finds_its_own_files_from_another_directory(self):
+        interpreter = self.stub_interpreter(".venv/bin/python")
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        lines = self.run_launcher(cwd=elsewhere)
+        self.assertEqual(lines, [f"interpreter={interpreter}", "args="])
+
+
+if __name__ == "__main__":
+    unittest.main()

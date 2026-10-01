@@ -9,6 +9,8 @@ Pieni supports the following providers (set the API key as environment variable 
 - Deepseek (DEEPSEEK_API_KEY)
 - Custom base URL, including local models e.g. llama-server / llama.cpp, ollama, LM studio, slang, vLLM
 
+![pieni AI agent](pieni3.jpg "pieni AI agent")
+
 ## CLI usage:
 ```console
 pieni provider -m "model name" # start agent with provider and mode name

@@ -6,9 +6,11 @@ so the default run is free and repeatable. Run with:
     python3 -m unittest tests.test_pieni
 """
 
+import copy
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -1195,7 +1197,7 @@ class AgentCommandTests(TempWorkspaceCase):
         self.assertEqual(len(agent.messages), 1)
         self.assertIn("short summary", agent.messages[0]["content"])
         self.assertIn("compacted", output[-1])
-        # The summary request carries the whole context and no tool schema.
+        # The summary request carries prepared history as data, with tools disabled.
         self.assertIn(pieni.COMPACT_INSTRUCTION, provider.requests[-1][-1]["content"])
         stored = store.resume("scripted", "scripted-model", str(self.workspace))[1]
         self.assertEqual(len(stored), 1)
@@ -1235,6 +1237,222 @@ class AgentCommandTests(TempWorkspaceCase):
         agent, _, _, output = self.make_agent([])
         agent.handle_command("/compact")
         self.assertIn("nothing to compact", output[-1])
+
+
+# ---------------------------------------------------------------------------
+# Compaction
+# ---------------------------------------------------------------------------
+
+class CompactionHistoryTests(unittest.TestCase):
+
+    def test_preserves_prose_prior_summary_and_short_tool_evidence(self):
+        messages = [
+            {"role": "user", "content": "[Summary of earlier conversation]\nDo not change the API."},
+            {"role": "user", "content": "Fix 文件.py; keep CRLF.\n" + "constraints\n" * 1000},
+            {"role": "assistant", "content": "Inspect first. " + "notes " * 1000,
+             "tool_calls": [{"id": "r1", "name": "read", "arguments": '{"path":"文件.py","start_line":2}'}]},
+            pieni.tool_message("r1", "read", "error: denied by the user"),
+            {"role": "assistant", "content": "The file was not read."},
+        ]
+        before = copy.deepcopy(messages)
+        history = json.loads(pieni.compaction_history(messages))
+        self.assertEqual(history[:2], messages[:2])
+        self.assertEqual(history[2]["content"], messages[2]["content"])
+        self.assertEqual(history[2]["tool_calls"], [
+            {"id": "r1", "name": "read", "arguments": {"path": "文件.py", "start_line": 2}}])
+        self.assertEqual(history[3:], messages[3:])
+        self.assertEqual(messages, before)
+
+    def test_bounds_outputs_and_payloads_but_preserves_paths_and_both_ends(self):
+        payload = "首" * 1000 + "discard-me" * 1000 + "尾" * 1000
+        path = "long/" * 500 + "文件.py"
+        arguments = {"path": path, "content": payload, "old_text": payload,
+                     "new_text": payload, "command": payload, "timeout": 60}
+        messages = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "w1", "name": "write", "arguments": arguments},
+                {"id": "b1", "name": "bash", "arguments": '{"command":"python3 -m unittest"}'},
+            ]},
+            pieni.tool_message("w1", "write", payload),
+            pieni.tool_message("b1", "bash", "exit code 1\nFAILED (failures=1)"),
+        ]
+        before = copy.deepcopy(messages)
+        history = json.loads(pieni.compaction_history(messages))
+        shortened = history[0]["tool_calls"][0]["arguments"]
+        self.assertEqual(shortened["path"], path)
+        self.assertEqual(shortened["timeout"], 60)
+        self.assertEqual(history[0]["tool_calls"][1]["arguments"]["command"], "python3 -m unittest")
+        for text in [history[1]["content"]] + [shortened[key] for key in ("content", "old_text", "new_text", "command")]:
+            self.assertTrue(text.startswith("首" * 1000))
+            self.assertTrue(text.endswith("尾" * 1000))
+            self.assertIn("[omitted 10000 characters]", text)
+            self.assertNotIn("discard-me", text)
+        self.assertEqual(history[2], messages[2])
+        self.assertEqual(messages, before)
+        self.assertLess(len(json.dumps(history, ensure_ascii=False)),
+                        len(json.dumps(messages, ensure_ascii=False)) // 2)
+
+    def test_malformed_arguments_survive_as_bounded_raw_text(self):
+        for raw in ("{not json", "[1, 2]", "5", "START" + "x" * 10000 + "END"):
+            with self.subTest(raw=raw[:20]):
+                messages = [{"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "bad", "name": "write", "arguments": raw}]}]
+                history = json.loads(pieni.compaction_history(messages))
+                arguments = history[0]["tool_calls"][0]["arguments"]
+                if len(raw) <= pieni.COMPACT_TOOL_CHARS:
+                    self.assertEqual(arguments, raw)
+                else:
+                    self.assertTrue(arguments.startswith("START"))
+                    self.assertTrue(arguments.endswith("END"))
+                    self.assertIn("[omitted", arguments)
+                self.assertEqual(messages[0]["tool_calls"][0]["arguments"], raw)
+
+    def test_output_limit_boundary_preserves_short_results_exactly(self):
+        for length in (0, pieni.COMPACT_TOOL_CHARS, pieni.COMPACT_TOOL_CHARS + 1):
+            with self.subTest(length=length):
+                text = "x" * length
+                history = json.loads(pieni.compaction_history([pieni.tool_message("r1", "read", text)]))
+                if length <= pieni.COMPACT_TOOL_CHARS:
+                    self.assertEqual(history[0]["content"], text)
+                else:
+                    self.assertIn("[omitted 1 characters]", history[0]["content"])
+
+
+class CompactionTests(TempWorkspaceCase):
+
+    def setUp(self):
+        super().setUp()
+        self.agent, self.provider, self.store, self.output = self.make_agent([reply_from(text="working summary")])
+        for message in (
+                {"role": "user", "content": "Keep the API and CRLF; fix 文件.py."},
+                {"role": "assistant", "content": "Inspecting the file.", "tool_calls": [
+                    {"id": "r1", "name": "read", "arguments": {"path": "文件.py", "start_line": 1}}]},
+                pieni.tool_message("r1", "read", "file start\n" + "source\n" * 1000 + "\nfile end"),
+                {"role": "assistant", "content": "No changes made or tests run."}):
+            self.agent.remember(message)
+        self.before = copy.deepcopy(self.agent.messages)
+
+    def assert_original_context(self):
+        self.assertEqual(self.agent.messages, self.before)
+        reopened = pieni.Store(self.store.path)
+        try:
+            session, messages = reopened.resume(self.provider.name, self.provider.model, str(self.workspace))
+            self.assertEqual(session, self.agent.session_id)
+            self.assertEqual(messages, self.before)
+            self.assertEqual(reopened.execute("SELECT COUNT(*) FROM messages").fetchone()[0], len(self.before))
+        finally:
+            reopened.close()
+        self.assertIn("unchanged", self.output[-1])
+
+    def test_single_data_only_request_and_summary_resume_for_all_provider_paths(self):
+        for kind, client_type, body in (
+                ("responses", FakeResponsesClient, responses_reply("working summary")),
+                ("chat", FakeChatClient, chat_reply("working summary")),
+                ("custom", FakeChatClient, chat_reply("working summary")),
+                ("openrouter", FakeSendClient, chat_reply("working summary"))):
+            for streaming in (True, False):
+                with self.subTest(kind=kind, streaming=streaming):
+                    agent, _, store, _ = self.make_agent([])
+                    for message in self.before:
+                        agent.remember(message)
+                    client = client_type(body)
+                    agent.provider = pieni.Provider("scripted", "scripted-model", kind, client, streaming=streaming)
+                    with mock.patch.object(agent.tools, "run") as run, redirect_stdout(StringIO()):
+                        self.assertTrue(agent.compact())
+                    run.assert_not_called()
+                    self.assertEqual(len(client.requests), 1)
+                    request = client.requests[0]
+                    self.assertNotIn("tools", request)
+                    wire = request["input" if kind == "responses" else "messages"]
+                    self.assertTrue(all(message["role"] in ("system", "user") for message in wire))
+                    self.assertEqual(request["instructions"] if kind == "responses" else wire[0]["content"],
+                                     agent.instructions)
+                    history = json.loads(wire[-1]["content"][len(pieni.COMPACT_INSTRUCTION) + 2:])
+                    self.assertEqual(history[0], self.before[0])
+                    self.assertIn("[omitted", history[2]["content"])
+                    logs = store.execute("SELECT active, payload FROM messages WHERE session_id=? ORDER BY id",
+                                         (agent.session_id,)).fetchall()
+                    self.assertEqual([json.loads(row["payload"]) for row in logs[:-1]], self.before)
+                    self.assertEqual([row["active"] for row in logs], [0] * len(self.before) + [1])
+                    reopened = pieni.Store(store.path)
+                    try:
+                        self.assertEqual(reopened.resume("scripted", "scripted-model", str(self.workspace))[1],
+                                         agent.messages)
+                    finally:
+                        reopened.close()
+                    self.assertEqual(len(agent.messages), 1)
+
+    def test_provider_failure_preserves_original_context(self):
+        self.provider.replies = [pieni.ProviderError("network failure")]
+        self.assertFalse(self.agent.compact())
+        self.assert_original_context()
+
+    def test_repeated_compaction_includes_previous_summary_and_latest_correction(self):
+        self.provider.replies = [reply_from(text="first summary"), reply_from(text="updated summary")]
+        self.assertTrue(self.agent.compact())
+        first = copy.deepcopy(self.agent.messages)
+        correction = {"role": "user", "content": "Correction: tests have now passed; preserve the API."}
+        self.agent.remember(correction)
+        self.assertTrue(self.agent.compact())
+        request = self.provider.requests[-1][-1]["content"]
+        history = json.loads(request[len(pieni.COMPACT_INSTRUCTION) + 2:])
+        self.assertEqual(history, first + [correction])
+        self.assertIn("updated summary", self.agent.messages[0]["content"])
+        self.assertEqual(self.store.resume(self.provider.name, self.provider.model, str(self.workspace))[1],
+                         self.agent.messages)
+
+    def test_empty_summary_preserves_original_context(self):
+        self.provider.replies = [reply_from(text=" \n\t")]
+        self.assertFalse(self.agent.compact())
+        self.assert_original_context()
+
+    def test_unrequested_tool_calls_preserve_context_and_are_never_executed(self):
+        self.provider.replies = [reply_from(calls=[("w1", "write", '{"path":"new.txt","content":"x"}')],
+                                           text="misleading summary")]
+        with mock.patch.object(self.agent.tools, "run") as run:
+            self.assertFalse(self.agent.compact())
+        run.assert_not_called()
+        self.assertIn("tool calls", self.output[-1])
+        self.assert_original_context()
+
+    def test_model_interruption_preserves_original_context(self):
+        self.provider.replies = [KeyboardInterrupt()]
+        self.assertFalse(self.agent.compact())
+        self.assert_original_context()
+
+    def test_database_read_failure_preserves_original_context(self):
+        with mock.patch.object(self.store, "last_message_id", side_effect=pieni.PieniError("read failed")):
+            self.assertFalse(self.agent.compact())
+        self.assertEqual(self.provider.requests, [])
+        self.assert_original_context()
+
+    def test_summary_insertion_failure_rolls_back_deactivation(self):
+        self.store.execute("CREATE TRIGGER fail_summary BEFORE INSERT ON messages "
+                           "BEGIN SELECT RAISE(ABORT, 'simulated disk error'); END", commit=True)
+        self.assertFalse(self.agent.compact())
+        self.assertIn("simulated disk error", self.output[-1])
+        self.assertFalse(self.store.connection.in_transaction)
+        self.assert_original_context()
+
+    def test_database_commit_failure_rolls_back_entire_replacement(self):
+        self.store.execute("PRAGMA busy_timeout = 0")
+        reader = sqlite3.connect(self.store.path)
+        try:
+            # A separate reader prevents the writer from acquiring its commit lock.
+            reader.execute("BEGIN")
+            reader.execute("SELECT payload FROM messages").fetchall()
+            self.assertFalse(self.agent.compact())
+        finally:
+            reader.close()
+        self.assertIn("database is locked", self.output[-1])
+        self.assertFalse(self.store.connection.in_transaction)
+        self.assert_original_context()
+
+    def test_database_write_interruption_rolls_back_deactivation(self):
+        with mock.patch.object(self.store, "add_message", side_effect=KeyboardInterrupt()):
+            self.assertFalse(self.agent.compact())
+        self.assertFalse(self.store.connection.in_transaction)
+        self.assert_original_context()
 
 
 # ---------------------------------------------------------------------------

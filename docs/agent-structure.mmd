@@ -1,0 +1,41 @@
+flowchart TB
+    User[User: terminal or headless task]
+    Settings[INI settings and CLI arguments]
+    Rules[System prompt and project AGENTS.md]
+
+    subgraph Harness["Pieni harness"]
+        Loop[Agent: conversation and model/tool loop]
+        Adapter[Provider: request and reply adapters]
+        Dispatch[Toolbox: validate and dispatch]
+        Policy[Permissions: path checks and DCG]
+        Tools[read / write / edit / bash]
+        Compact[Prepare history and request a summary]
+        History[Store: active messages and historical logs]
+    end
+
+    SDK[openai or openrouter SDK]
+    Model[Remote API or local model server]
+    OS[Local files and subprocesses: current user's access]
+    DB[(.pieni/pieni.db)]
+
+    User --> Loop
+    Settings --> Adapter
+    Settings --> Policy
+    Rules --> Loop
+    Loop --> Adapter
+    Adapter --> SDK
+    SDK --> Model
+    Model --> SDK
+    SDK --> Adapter
+    Adapter --> Loop
+    Loop --> Dispatch
+    Dispatch --> Policy
+    Policy -->|allowed| Tools
+    Policy -->|denied result| Loop
+    Tools --> OS
+    OS -->|result or error| Tools
+    Tools -->|tool result| Loop
+    Loop <--> History
+    History <--> DB
+    Loop --> Compact
+    Compact --> Adapter

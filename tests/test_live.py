@@ -12,7 +12,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from io import StringIO
 from pathlib import Path
 
@@ -77,6 +77,33 @@ class LiveSmokeTest(unittest.TestCase):
             with sqlite3.connect(database) as connection:
                 after = connection.execute("SELECT COUNT(*) FROM messages WHERE role='tool'").fetchone()[0]
             self.assertEqual(before, after, resumed)  # historical calls were not executed again
+
+    def test_compaction_preserves_constraints_failure_and_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            with closing(pieni.build_provider(PROVIDER, MODEL)) as provider:
+                with closing(pieni.Store(workspace / pieni.DB_PATH)) as store:
+                    session = store.start_session(PROVIDER, MODEL, directory)
+                    agent = pieni.Agent(provider, store, session, pieni.SYSTEM_PROMPT, [], workspace,
+                                        pieni.Permissions("auto", workspace))
+                    for message in (
+                            {"role": "user", "content": "Fix parser.py. Preserve CRLF and do not change the public API."},
+                            {"role": "assistant", "content": "Running tests.", "tool_calls": [
+                                {"id": "t1", "name": "bash", "arguments": '{"command":"python3 -m unittest"}'}]},
+                            pieni.tool_message("t1", "bash", "exit code 1\n" + "." * 40000 +
+                                               "\nFAIL: test_crlf\nExpected CRLF, got LF.\nFAILED (failures=1)"),
+                            {"role": "assistant", "content": "No files changed. test_crlf still fails. Next inspect parser.py."}):
+                        agent.remember(message)
+                    with redirect_stdout(StringIO()):
+                        self.assertTrue(agent.compact())
+                    self.assertEqual(len(agent.messages), 1)
+                    summary = agent.messages[0]["content"]
+                    for fact in ("parser.py", "CRLF", "API", "test_crlf"):
+                        self.assertIn(fact, summary)
+                    active = list(agent.messages)
+            with closing(pieni.Store(workspace / pieni.DB_PATH)) as reopened:
+                self.assertEqual(reopened.resume(PROVIDER, MODEL, directory)[1], active)
+                self.assertEqual(reopened.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 5)
 
 
 if __name__ == "__main__":

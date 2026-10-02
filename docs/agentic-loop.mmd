@@ -1,0 +1,20 @@
+stateDiagram-v2
+    [*] --> SavePrompt
+    SavePrompt --> CheckBudget
+    CheckBudget --> RequestModel: fewer than 500 rounds used
+    CheckBudget --> Stopped: budget exhausted
+    RequestModel --> SaveReply: complete reply received
+    RequestModel --> Stopped: provider error or interruption
+    SaveReply --> Answer: no tool calls
+    SaveReply --> ValidateCall: tool calls present
+    ValidateCall --> CheckPermission: valid tool and arguments
+    ValidateCall --> SaveResult: invalid call produces an error
+    CheckPermission --> Execute: allowed or approved
+    CheckPermission --> SaveResult: denied produces an error
+    Execute --> SaveResult: success or tool failure
+    Execute --> RecordInterrupted: Ctrl+C
+    RecordInterrupted --> Stopped: record unresolved calls, effects may be partial
+    SaveResult --> ValidateCall: another call in this reply
+    SaveResult --> CheckBudget: all calls have results
+    Answer --> [*]
+    Stopped --> [*]

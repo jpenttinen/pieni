@@ -162,6 +162,11 @@ Provide a small Bash launcher named `pieni`; tests live in separate Python files
 - Compaction retains the system prompt, workspace instructions, and tool
   definitions. Persist the new active context; keep old messages as logs, not
   automatically restored context. A failed compaction leaves context unchanged.
+  Before summarizing, shorten bulky tool output and argument text to 2,000 retained
+  characters (half from each end), keeping file paths and ordinary conversation.
+  Send that temporary history as JSON data with tools disabled. Preserve constraints,
+  verified outcomes, failures, and next steps in the summary; replace active context
+  in one SQLite transaction so database failures leave the old context resumable.
 - Keep failures understandable: invalid configuration, network/API failures,
   unsupported tool calling, file/DB errors, and oversized context. No elaborate
   retry system or automatic context-size detection.

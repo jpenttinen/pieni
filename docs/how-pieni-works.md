@@ -1,17 +1,16 @@
-# How Pieni works—and how AI harnesses and agents work in general
+# How Pieni works — and how AI harnesses and agents work in general
 
-Suppose you ask an agent: “Fix the parser so that empty input raises an error.
-Do not change its public API. Run the tests.”
+A model alone cannot do anything. It cannot modify or read files, run commands or access the internet.
+It needs an AI harness to agent to do those tasks and designing your own harness is perhaps among the
+difficult tasks, especially if you plan to support lots of models, providers and plan to have lots of
+features.
 
-The model does not open your editor or start Python. It returns requests such as
-“read `parser.py`” and “run this test command.” A program receives those requests,
-checks them, runs the operations, and sends the results back to the model.
-That program is the **harness**. The model, harness, tools, and execution
-environment together make up the agent.
+Pieni is a tiny AI agent or AI harness written for education purposes make it perfect
+to study how agentic coding actually work and how to build your own agent. Understanding these
+core things, can make you also more efficient in using other AI agents.
 
-Pieni keeps that program in [one Python file](../pieni.py), roughly 1,400 lines.
-This guide follows its actual implementation. Examples of model replies and test
-output below are illustrative, not records of a completed task.
+Pieni is just [one Python file](../pieni.py), roughly 1,400 lines.
+This guide follows its actual implementation. 
 
 ## Contents
 
@@ -46,7 +45,7 @@ on the provider's server. This distinction matters for both debugging and privac
 
 ### Why other agents are much larger
 
-Codex, Claude Code, and Hermes Agent have a much wider job than this example.
+The popular agents, like Codex, Claude Code, and Hermes Agent have over million lines of code or more.
 Their surrounding systems include interfaces, integrations, execution policies,
 and long-running state management. Some concrete differences:
 
@@ -63,15 +62,13 @@ and [Hermes's architecture guide](https://hermes-agent.nousresearch.com/docs/dev
 For example, delivering a Hermes task result to a messaging platform requires
 authorization, session routing, and delivery code that Pieni's terminal does not need.
 
-Be careful with claims like “these agents are often 2+ million lines of code.”
-There is no comparable, verified count for all three here. A count of authored
-source is different from a count including tests, generated code, bundled
-dependencies, desktop clients, or hosted services. A useful size comparison needs
-a repository, a revision, and a stated counting method. The concrete comparison
-is scope: Pieni leaves out most of the components above so its execution path
-remains readable.
+Pieni leaves out most of the components above so it can be small, but it can still do real work
+or even big work, if you let it. Small doesn't mean stupid.
 
 ## A tool call, from request to result
+
+Tool calls is what gives the agent ability to do things, like change files, read the file system,
+test the program, run the web browser.
 
 Pieni exposes four tool schemas in `TOOL_SPECS`:
 

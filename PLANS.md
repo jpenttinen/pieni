@@ -102,6 +102,10 @@ Provide a small Bash launcher named `pieni`; tests live in separate Python files
   Provider and `-m` may be omitted when supplied by configuration.
 - `-r/--run "prompt"` runs one headless task. `--permissions auto|yolo` selects
   permissions for either interface; default is `auto`.
+- `-p/--prompt "prompt"` asks for one standalone reply with tools disabled and
+  exits. Send only the user prompt, without project instructions or saved context;
+  do not create or modify a session. Respect the streaming setting and CLI
+  overrides. This option is mutually exclusive with `-r/--run`.
 - `--streaming` enables streaming; `--no-streaming` disables it. These mutually
   exclusive CLI flags override the layered INI setting. When neither flag is
   supplied, retain the file setting or the built-in `true` default.
@@ -175,9 +179,14 @@ These are reviewable steps, not separate subsystems or a large PR program.
    and remaining failure-path tests. Optional live smoke tests with an explicitly
    selected provider/model; no paid calls in the default test run.
    Done: launcher, `requirements.txt`, README, `test_sdk_wire.py`, and
-   `test_live.py` (opt-in); `pieni.py` is ~1,440 lines, above the ~750 guideline.
+   `test_live.py` (opt-in); `pieni.py` is ~1,340 lines after deduplication and the
+   standalone prompt option, above the ~750 guideline. File-tool validation and
+   permission checks share one path;
+   Chat Completions and OpenRouter share request/reply handling.
    Streaming defaults, layered configuration, and failure-path tests are also
-   implemented (`test_streaming.py`); live streaming remains unverified.
+   implemented (`test_streaming.py`). Local Qwen smoke tests cover streaming and
+   buffered replies, all four tools, Unicode files, and resume; hosted streaming
+   remains unverified after the refactor.
    Also added `scripts/install.sh` (Ubuntu installer, tested by `test_install.py`)
    with the launcher following symlinks so an installed command still finds its
    own files; that is packaging, not agent scope.

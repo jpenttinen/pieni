@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pieni
-import test_pieni as fixtures
+from tests import test_pieni as fixtures
 
 
 def chunk(delta=None, finish=None, usage=None):

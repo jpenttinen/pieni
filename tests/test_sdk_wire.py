@@ -6,9 +6,9 @@ that the SDK then parses. That is how the request and response shapes in
 pieni.py are checked against the installed `openai` and `openrouter` packages.
 
 Run them with the project virtualenv on the path (the default offline suite,
-`test_pieni`, does not need the SDKs):
+`tests.test_pieni`, does not need the SDKs):
 
-    PYTHONPATH=.venv/lib/python3.12/site-packages python3 -m unittest test_sdk_wire
+    .venv/bin/python -m unittest tests.test_sdk_wire
 
 They skip when a needed SDK is not importable.
 """

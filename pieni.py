@@ -21,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -47,7 +48,7 @@ MAX_STEPS = 500
 THINK_TRACE_CHARACTERS = 120  # how much of a model thinking trace to display
 THINK_DOT_INTERVAL = 1.0      # print one "." this often while waiting for the model
 PROMPT = "pieni> "
-VERSION = "0.12"
+VERSION = "0.13"
 BANNER = f"Pieni agent v{VERSION} by Petri Kuittinen"
 
 SYSTEM_PROMPT = """You are Pieni, a small coding agent working in a local workspace.
@@ -72,7 +73,7 @@ yolo skips approval and guard checks, not argument validation or timeouts."""
 
 # Shown when Pieni is started with no arguments at all: it cannot guess a provider,
 # so it explains how to start instead of failing.
-USAGE = """usage: pieni [PROVIDER] [-m MODEL] [-r PROMPT] [--permissions auto|yolo]
+USAGE = """usage: pieni [PROVIDER] [-m MODEL] [-r TASK | -p PROMPT] [--permissions auto|yolo]
              [--streaming | --no-streaming]
 
 Started with no arguments, Pieni prints this help and exits. To run it, pass a
@@ -83,6 +84,7 @@ provider, or set provider and model in ~/.pieni/pieni.ini or ./pieni.ini:
   pieni openrouter -m MODEL
   pieni http://localhost:30000 -m MODEL  local OpenAI-compatible server
   pieni openai -m MODEL -r "prompt"      run one task, then exit
+  pieni openai -m MODEL -p "question"    one reply, without tools or history
   pieni --help                           all command-line options"""
 
 YOLO_WARNING = ("warning: yolo skips approval and destructive-command checks; "
@@ -117,54 +119,44 @@ class ProviderError(PieniError):
     """The provider could not serve a request."""
 
 
+@dataclass
 class ToolOutcome:
     """Result of one tool call: ok flag, short cause, and text for the model."""
 
-    __slots__ = ("ok", "detail", "output")
-
-    def __init__(self, ok, detail, output):
-        self.ok = ok
-        self.detail = detail
-        self.output = output
+    ok: bool
+    detail: str
+    output: str
 
 
+@dataclass
 class ToolCall:
     """A tool call requested by the model."""
 
-    __slots__ = ("id", "name", "arguments")
-
-    def __init__(self, id, name, arguments):
-        self.id = id
-        self.name = name
-        self.arguments = arguments  # raw JSON string as sent by the model
+    id: str
+    name: str
+    arguments: str  # raw JSON string as sent by the model
 
 
+@dataclass
 class Reply:
     """One normalized model reply: text, tool calls, usage, and any thinking."""
 
-    __slots__ = ("text", "tool_calls", "input_tokens", "output_tokens", "estimated",
-                 "thinking")
-
-    def __init__(self, text, tool_calls, input_tokens, output_tokens, estimated,
-                 thinking=""):
-        self.text = text
-        self.tool_calls = tool_calls
-        self.input_tokens = input_tokens
-        self.output_tokens = output_tokens
-        self.estimated = estimated
-        # Whatever reasoning the provider returned, for display only: thinking is
-        # never added to the conversation, so it costs no context and is not saved.
-        self.thinking = thinking
+    text: str
+    tool_calls: list
+    input_tokens: int
+    output_tokens: int
+    estimated: bool
+    thinking: str = ""  # display only; never saved or sent back to the provider
 
 
+@dataclass
 class TaskUsage:
     """Token and time accounting for one task (one prompt up to the answer)."""
 
-    def __init__(self):
-        self.input_tokens = 0
-        self.output_tokens = 0
-        self.estimated = False  # True when any count came from a text estimate
-        self.elapsed_seconds = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    estimated: bool = False  # True when any count came from a text estimate
+    elapsed_seconds: float = 0.0
 
     @property
     def total_tokens(self):
@@ -254,12 +246,9 @@ def load_config(cli_provider=None, cli_model=None, cli_permissions=None,
 def provider_kind(provider):
     """Classify a provider name or base URL into one of the three wire formats."""
     name = provider.strip().lower()
-    if name == "openai":
-        return "responses"
-    if name == "deepseek":
-        return "chat"
-    if name == "openrouter":
-        return "openrouter"
+    kinds = {"openai": "responses", "deepseek": "chat", "openrouter": "openrouter"}
+    if name in kinds:
+        return kinds[name]
     if re.match(r"^https?://", name):
         return "custom"
     raise ConfigError(f"unknown provider '{provider}': expected openai, openrouter, "
@@ -284,9 +273,7 @@ def build_instructions(workspace):
 
 def estimate_tokens(text):
     """Rough token count from text length; used only when no usage is reported."""
-    if not text:
-        return 0
-    return max(1, len(text) // CHARS_PER_TOKEN)
+    return max(1, len(text) // CHARS_PER_TOKEN) if text else 0
 
 
 def truncate(text, limit=MAX_OUTPUT_CHARS):
@@ -395,10 +382,7 @@ def dcg_reason(command):
 
 def resolve_path(workspace, path):
     """Resolve a tool path against the workspace, following '..' and symlinks."""
-    candidate = Path(path).expanduser()
-    if not candidate.is_absolute():
-        candidate = workspace / candidate
-    return candidate.resolve()
+    return (workspace / Path(path).expanduser()).resolve()
 
 
 def is_inside(path, root):
@@ -415,9 +399,8 @@ class Permissions:
         self.approve = approve  # callable(kind, detail, reason) -> bool, or None
 
     def check_file(self, resolved, action):
-        if self.mode == "yolo":
-            return True, ""
-        if is_inside(resolved, self.workspace) or is_inside(resolved, self.tempdir):
+        if (self.mode == "yolo" or is_inside(resolved, self.workspace)
+                or is_inside(resolved, self.tempdir)):
             return True, ""
         return self.ask("file", f"{action} {resolved}",
                         "the path is outside the workspace and temp directory")
@@ -438,64 +421,32 @@ class Permissions:
         return False, f"denied by the user: {reason}"
 
 
-def denied(reason):
-    return ToolOutcome(False, "denied", f"error: {reason}")
-
-
 # --- Tools -----------------------------------------------------------------
 
+def tool_spec(name, description, required, **properties):
+    """Build the repeated JSON schema shape once, for the model and validation."""
+    return {"name": name, "description": description, "parameters": {
+        "type": "object", "required": required,
+        "properties": {key: {"type": kind, "description": text}
+                       for key, (kind, text) in properties.items()},
+    }}
+
+
+PATH_PROPERTY = ("string", "File path, relative to the workspace or absolute.")
 TOOL_SPECS = (
-    {
-        "name": "read",
-        "description": "Read a UTF-8 text file, optionally a line range.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "File path, relative to the workspace or absolute."},
-                "start_line": {"type": "integer", "description": "First line to return, 1-based."},
-                "end_line": {"type": "integer", "description": "Last line to return, inclusive."},
-            },
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "write",
-        "description": "Create or replace a UTF-8 text file.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "File path, relative to the workspace or absolute."},
-                "content": {"type": "string", "description": "Full new content of the file."},
-            },
-            "required": ["path", "content"],
-        },
-    },
-    {
-        "name": "edit",
-        "description": "Replace one exact text match in a UTF-8 file. Fails when the "
-                       "text is missing or matches more than once.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "File path, relative to the workspace or absolute."},
-                "old_text": {"type": "string", "description": "Exact existing text to replace."},
-                "new_text": {"type": "string", "description": "Replacement text."},
-            },
-            "required": ["path", "old_text", "new_text"],
-        },
-    },
-    {
-        "name": "bash",
-        "description": "Run a shell command in the workspace and return its output.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "Shell command to run."},
-                "timeout": {"type": "integer", "description": f"Seconds to wait, 1-600 (default {BASH_TIMEOUT})."},
-            },
-            "required": ["command"],
-        },
-    },
+    tool_spec("read", "Read a UTF-8 text file, optionally a line range.", ["path"],
+              path=PATH_PROPERTY,
+              start_line=("integer", "First line to return, 1-based."),
+              end_line=("integer", "Last line to return, inclusive.")),
+    tool_spec("write", "Create or replace a UTF-8 text file.", ["path", "content"],
+              path=PATH_PROPERTY, content=("string", "Full new content of the file.")),
+    tool_spec("edit", "Replace one exact text match in a UTF-8 file. Fails when the "
+              "text is missing or matches more than once.", ["path", "old_text", "new_text"],
+              path=PATH_PROPERTY, old_text=("string", "Exact existing text to replace."),
+              new_text=("string", "Replacement text.")),
+    tool_spec("bash", "Run a shell command in the workspace and return its output.", ["command"],
+              command=("string", "Shell command to run."),
+              timeout=("integer", f"Seconds to wait, 1-600 (default {BASH_TIMEOUT}).")),
 )
 
 
@@ -507,6 +458,7 @@ class Toolbox:
         self.permissions = permissions
         self.handlers = {"read": self.read, "write": self.write,
                          "edit": self.edit, "bash": self.bash}
+        self.parameters = {spec["name"]: spec["parameters"] for spec in TOOL_SPECS}
 
     def run(self, name, arguments):
         handler = self.handlers.get(name)
@@ -514,7 +466,14 @@ class Toolbox:
             known = ", ".join(sorted(self.handlers))
             return ToolOutcome(False, "unknown tool", f"error: unknown tool '{name}' (known: {known})")
         try:
-            return handler(arguments)
+            self.validate(arguments, self.parameters[name])
+            if name == "bash":
+                return handler(**arguments)
+            resolved = resolve_path(self.workspace, arguments["path"])
+            allowed, reason = self.permissions.check_file(resolved, name)
+            if not allowed:
+                return ToolOutcome(False, "denied", f"error: {reason}")
+            return handler(resolved=resolved, **arguments)
         except PieniError as exc:
             return ToolOutcome(False, str(exc), f"error: {exc}")
         except (OSError, UnicodeDecodeError, subprocess.SubprocessError) as exc:
@@ -522,77 +481,51 @@ class Toolbox:
 
     # -- argument validation ------------------------------------------------
 
-    def keys(self, arguments, allowed):
-        unknown = set(arguments) - set(allowed)
+    def validate(self, arguments, parameters):
+        """Use the tool schema for types/keys; bounds stay with each tool."""
+        properties = parameters["properties"]
+        unknown = set(arguments) - properties.keys()
         if unknown:
             raise PieniError(f"unknown argument(s): {', '.join(sorted(unknown))}")
-
-    def text(self, arguments, key):
-        value = arguments.get(key)
-        if not isinstance(value, str):
-            raise PieniError(f"argument '{key}' must be a string")
-        if not value:
-            raise PieniError(f"argument '{key}' must not be empty")
-        return value
-
-    def optional_int(self, arguments, key, default):
-        value = arguments.get(key)
-        if value is None:
-            return default
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise PieniError(f"argument '{key}' must be an integer")
-        return value
+        for key, spec in properties.items():
+            value = arguments.get(key)
+            if value is None and key not in parameters["required"]:
+                continue  # optional nulls have the same meaning as omitted values
+            if spec["type"] == "integer":
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise PieniError(f"argument '{key}' must be an integer")
+            elif not isinstance(value, str):
+                raise PieniError(f"argument '{key}' must be a string")
+            if key in ("path", "command", "old_text") and not value:
+                raise PieniError(f"argument '{key}' must not be empty")
 
     # -- tools ---------------------------------------------------------------
 
-    def read(self, arguments):
-        self.keys(arguments, ("path", "start_line", "end_line"))
-        path = self.text(arguments, "path")
-        resolved = resolve_path(self.workspace, path)
-        allowed, reason = self.permissions.check_file(resolved, "read")
-        if not allowed:
-            return denied(reason)
+    def read(self, path, resolved, start_line=None, end_line=None):
         lines = resolved.read_text(encoding="utf-8").splitlines()
-        first = self.optional_int(arguments, "start_line", 1)
-        last = self.optional_int(arguments, "end_line", len(lines))
+        first = 1 if start_line is None else start_line
+        if not lines and first == 1 and end_line is None:
+            return ToolOutcome(True, "", f"{path} (0 lines)")
+        last = len(lines) if end_line is None else end_line
         if first < 1 or last < first:
             raise PieniError(f"invalid line range {first}-{last} for {len(lines)} lines")
-        selected = lines[first - 1:last]
+        count = max(0, min(last, len(lines)) - first + 1)
+        selected = lines[first - 1:min(last, first - 1 + MAX_READ_LINES)]
         notes = []
-        if len(selected) > MAX_READ_LINES:
-            notes.append(f"[showing the first {MAX_READ_LINES} of {len(selected)} selected lines]")
-            selected = selected[:MAX_READ_LINES]
+        if count > MAX_READ_LINES:
+            notes.append(f"[showing the first {MAX_READ_LINES} of {count} selected lines]")
         header = f"{path} (lines {first}-{min(last, len(lines))} of {len(lines)})"
         body = "\n".join([header] + notes + selected)
         return ToolOutcome(True, "", truncate(body))
 
-    def write(self, arguments):
-        self.keys(arguments, ("path", "content"))
-        path = self.text(arguments, "path")
-        content = arguments.get("content")
-        if not isinstance(content, str):
-            raise PieniError("argument 'content' must be a string")
-        resolved = resolve_path(self.workspace, path)
-        allowed, reason = self.permissions.check_file(resolved, "write")
-        if not allowed:
-            return denied(reason)
+    def write(self, path, resolved, content):
         existed = resolved.exists()
         resolved.parent.mkdir(parents=True, exist_ok=True)  # allow new folders
         resolved.write_text(content, encoding="utf-8")
         action = "replaced" if existed else "created"
         return ToolOutcome(True, "", f"{action} {path} ({len(content)} characters)")
 
-    def edit(self, arguments):
-        self.keys(arguments, ("path", "old_text", "new_text"))
-        path = self.text(arguments, "path")
-        old_text = self.text(arguments, "old_text")
-        new_text = arguments.get("new_text")
-        if not isinstance(new_text, str):
-            raise PieniError("argument 'new_text' must be a string")
-        resolved = resolve_path(self.workspace, path)
-        allowed, reason = self.permissions.check_file(resolved, "edit")
-        if not allowed:
-            return denied(reason)
+    def edit(self, path, resolved, old_text, new_text):
         text = resolved.read_text(encoding="utf-8")
         matches = text.count(old_text)
         if matches == 0:
@@ -603,15 +536,13 @@ class Toolbox:
         resolved.write_text(text.replace(old_text, new_text, 1), encoding="utf-8")
         return ToolOutcome(True, "", f"replaced one occurrence in {path}")
 
-    def bash(self, arguments):
-        self.keys(arguments, ("command", "timeout"))
-        command = self.text(arguments, "command")
-        timeout = self.optional_int(arguments, "timeout", BASH_TIMEOUT)
+    def bash(self, command, timeout=None):
+        timeout = BASH_TIMEOUT if timeout is None else timeout
         if not 1 <= timeout <= 600:
             raise PieniError("argument 'timeout' must be between 1 and 600 seconds")
         allowed, reason = self.permissions.check_shell(command)
         if not allowed:
-            return denied(reason)
+            return ToolOutcome(False, "denied", f"error: {reason}")
         try:
             completed = subprocess.run(
                 command, shell=True, cwd=self.workspace, capture_output=True,
@@ -711,11 +642,6 @@ def to_responses_input(messages):
     return items
 
 
-def split_instructions(messages):
-    text = "\n\n".join(m["content"] for m in messages if m["role"] == "system" and m.get("content"))
-    return text, [m for m in messages if m["role"] != "system"]
-
-
 def attribute(obj, name, default=None):
     """Read a field from an SDK object or a plain dict."""
     if isinstance(obj, dict):
@@ -765,21 +691,6 @@ def thinking_from_message(message):
         if text:
             return text
     return ""
-
-
-def thinking_from_output(items):
-    """Thinking text from Responses API output items of type 'reasoning'."""
-    parts = [reasoning_text(item) for item in items if attribute(item, "type") == "reasoning"]
-    return "\n".join(part for part in parts if part)
-
-
-def tool_calls_from_chat(message):
-    calls = []
-    for call in attribute(message, "tool_calls") or []:
-        function = attribute(call, "function")
-        calls.append(ToolCall(attribute(call, "id"), attribute(function, "name"),
-                              attribute(function, "arguments") or "{}"))
-    return calls
 
 
 def collect_chat_stream(stream, on_text=None):
@@ -852,16 +763,22 @@ def collect_responses_stream(stream, on_text=None):
             close()
 
 
-def call_chat_completions(client, model, messages, tools, streaming=DEFAULT_STREAMING, on_text=None):
-    """OpenAI-compatible Chat Completions: DeepSeek and custom base URLs."""
+def make_reply(text, calls, thinking, tokens, wire, tools):
+    """Share usage fallback across the three SDK request paths."""
+    estimated = tokens is None
+    inputs, outputs = estimated_pair(wire, tools, text, calls) if estimated else tokens
+    return Reply(text, calls, inputs, outputs, estimated, thinking)
+
+
+def call_chat(send, model, messages, tools, streaming, on_text, include_usage=False):
+    """Shared Chat Completions request/response handling, including OpenRouter."""
     wire = to_chat_messages(messages)
-    request = {"model": model, "messages": wire}
+    request = {"model": model, "messages": wire, "stream": streaming}
     if tools:
         request["tools"] = tools
-    request["stream"] = streaming
-    if streaming:
+    if streaming and include_usage:
         request["stream_options"] = {"include_usage": True}
-    response = client.chat.completions.create(**request)
+    response = send(**request)
     if streaming:
         response = collect_chat_stream(response, on_text)
     choices = attribute(response, "choices") or []
@@ -869,23 +786,32 @@ def call_chat_completions(client, model, messages, tools, streaming=DEFAULT_STRE
         raise ProviderError("the provider returned no choices")
     message = attribute(choices[0], "message")
     text = attribute(message, "content") or ""
-    calls = tool_calls_from_chat(message)
+    calls = [ToolCall(attribute(call, "id"), attribute(attribute(call, "function"), "name"),
+                      attribute(attribute(call, "function"), "arguments") or "{}")
+             for call in attribute(message, "tool_calls") or []]
     tokens = usage_pair(attribute(response, "usage"), "prompt_tokens", "completion_tokens")
-    estimated = tokens is None
-    if estimated:
-        tokens = estimated_pair(wire, tools, text, calls)
-    return Reply(text, calls, tokens[0], tokens[1], estimated, thinking_from_message(message))
+    return make_reply(text, calls, thinking_from_message(message), tokens, wire, tools)
+
+
+def call_chat_completions(client, model, messages, tools, streaming=DEFAULT_STREAMING, on_text=None):
+    return call_chat(client.chat.completions.create, model, messages, tools,
+                     streaming, on_text, include_usage=True)
+
+
+def call_openrouter(client, model, messages, tools, streaming=DEFAULT_STREAMING, on_text=None):
+    return call_chat(client.chat.send, model, messages, tools, streaming, on_text)
 
 
 def call_responses(client, model, messages, tools, streaming=DEFAULT_STREAMING, on_text=None):
     """OpenAI Responses API."""
-    instructions, rest = split_instructions(messages)
-    request = {"model": model, "input": to_responses_input(rest)}
+    instructions = "\n\n".join(m["content"] for m in messages
+                               if m["role"] == "system" and m.get("content"))
+    wire = to_responses_input(messages)
+    request = {"model": model, "input": wire, "stream": streaming}
     if instructions:
         request["instructions"] = instructions
     if tools:
         request["tools"] = tools
-    request["stream"] = streaming
     response = client.responses.create(**request)
     if streaming:
         response = collect_responses_stream(response, on_text)
@@ -899,33 +825,8 @@ def call_responses(client, model, messages, tools, streaming=DEFAULT_STREAMING, 
     if not text and not calls:
         raise ProviderError("the provider returned neither text nor tool calls")
     tokens = usage_pair(attribute(response, "usage"), "input_tokens", "output_tokens")
-    estimated = tokens is None
-    if estimated:
-        tokens = estimated_pair(to_responses_input(rest), tools, text, calls)
-    return Reply(text, calls, tokens[0], tokens[1], estimated, thinking_from_output(items))
-
-
-def call_openrouter(client, model, messages, tools, streaming=DEFAULT_STREAMING, on_text=None):
-    """OpenRouter SDK, which speaks the Chat Completions shape."""
-    wire = to_chat_messages(messages)
-    request = {"model": model, "messages": wire}
-    if tools:
-        request["tools"] = tools
-    request["stream"] = streaming
-    response = client.chat.send(**request)
-    if streaming:
-        response = collect_chat_stream(response, on_text)
-    choices = attribute(response, "choices") or []
-    if not choices:
-        raise ProviderError("the provider returned no choices")
-    message = attribute(choices[0], "message")
-    text = attribute(message, "content") or ""
-    calls = tool_calls_from_chat(message)
-    tokens = usage_pair(attribute(response, "usage"), "prompt_tokens", "completion_tokens")
-    estimated = tokens is None
-    if estimated:
-        tokens = estimated_pair(wire, tools, text, calls)
-    return Reply(text, calls, tokens[0], tokens[1], estimated, thinking_from_message(message))
+    thinking = [reasoning_text(item) for item in items if attribute(item, "type") == "reasoning"]
+    return make_reply(text, calls, "\n".join(part for part in thinking if part), tokens, wire, tools)
 
 
 def load_sdk(module_name, attribute_name):
@@ -935,11 +836,6 @@ def load_sdk(module_name, attribute_name):
         raise ConfigError(f"missing dependency '{module_name}': "
                           f"run pip install -r requirements.txt") from exc
     return getattr(module, attribute_name)
-
-
-def require_key(environment, variable, provider):
-    if not environment.get(variable):
-        raise ConfigError(f"{provider} needs the {variable} environment variable")
 
 
 class Provider:
@@ -955,17 +851,11 @@ class Provider:
 
     def complete(self, messages, use_tools=True, on_text=None):
         try:
-            if self.kind == "responses":
-                return call_responses(self.client, self.model, messages,
-                                      responses_tools() if use_tools else None,
-                                      self.streaming, on_text)
-            if self.kind == "openrouter":
-                return call_openrouter(self.client, self.model, messages,
-                                       chat_tools() if use_tools else None,
-                                       self.streaming, on_text)
-            return call_chat_completions(self.client, self.model, messages,
-                                         chat_tools() if use_tools else None,
-                                         self.streaming, on_text)
+            call = {"responses": call_responses, "openrouter": call_openrouter}.get(
+                self.kind, call_chat_completions)
+            tools = responses_tools() if self.kind == "responses" else chat_tools()
+            return call(self.client, self.model, messages, tools if use_tools else None,
+                        self.streaming, on_text)
         except PieniError:
             raise
         except Exception as exc:  # SDK and network failures become one clear message
@@ -984,18 +874,11 @@ def build_provider(provider_name, model, environment=None, streaming=DEFAULT_STR
     if not model:
         raise ConfigError("no model set: pass -m/--model or add model to pieni.ini")
     try:
-        if kind == "responses":
-            require_key(environment, "OPENAI_API_KEY", "openai")
-            OpenAI = load_sdk("openai", "OpenAI")
-            return Provider(provider_name, model, kind, OpenAI(), streaming=streaming)
-        if kind == "chat":
-            require_key(environment, "DEEPSEEK_API_KEY", "deepseek")
-            OpenAI = load_sdk("openai", "OpenAI")
-            client = OpenAI(api_key=environment["DEEPSEEK_API_KEY"],
-                            base_url=DEEPSEEK_BASE_URL)
-            return Provider(provider_name, model, kind, client, streaming=streaming)
+        key_name = {"responses": "OPENAI_API_KEY", "chat": "DEEPSEEK_API_KEY",
+                    "openrouter": "OPENROUTER_API_KEY"}.get(kind)
+        if key_name and not environment.get(key_name):
+            raise ConfigError(f"{provider_name} needs the {key_name} environment variable")
         if kind == "openrouter":
-            require_key(environment, "OPENROUTER_API_KEY", "openrouter")
             OpenRouter = load_sdk("openrouter", "OpenRouter")
             stack = contextlib.ExitStack()
             try:
@@ -1005,12 +888,17 @@ def build_provider(provider_name, model, environment=None, streaming=DEFAULT_STR
                 raise
             return Provider(provider_name, model, kind, client, close=stack.close,
                             streaming=streaming)
-        # Custom base URL: the openai SDK's Chat Completions covers local servers,
-        # which often need no key at all.
         OpenAI = load_sdk("openai", "OpenAI")
-        client = OpenAI(api_key=environment.get("OPENAI_API_KEY") or "not-needed",
-                        base_url=provider_name)
-        return Provider(provider_name, model, kind, client, streaming=streaming)
+        options = {}
+        if kind == "chat":
+            options = {"api_key": environment[key_name], "base_url": DEEPSEEK_BASE_URL}
+        elif kind == "custom":
+            # Local servers often need no key; the SDK still requires a placeholder.
+            options = {"api_key": environment.get("OPENAI_API_KEY") or "not-needed",
+                       "base_url": provider_name}
+        client = OpenAI(**options)
+        return Provider(provider_name, model, kind, client, close=getattr(client, "close", None),
+                        streaming=streaming)
     except PieniError:
         raise
     except Exception as exc:
@@ -1052,15 +940,12 @@ class Store:
         except (OSError, sqlite3.Error) as exc:
             raise PieniError(f"cannot open the database {self.path}: {exc}") from exc
 
-    def execute(self, sql, parameters=()):
+    def execute(self, sql, parameters=(), commit=False):
         try:
-            return self.connection.execute(sql, parameters)
-        except sqlite3.Error as exc:
-            raise PieniError(f"database error: {exc}") from exc
-
-    def commit(self):
-        try:
-            self.connection.commit()
+            cursor = self.connection.execute(sql, parameters)
+            if commit:
+                self.connection.commit()
+            return cursor
         except sqlite3.Error as exc:
             raise PieniError(f"database error: {exc}") from exc
 
@@ -1076,19 +961,16 @@ class Store:
         return row["id"], [self._decode(row["payload"]) for row in rows]
 
     def start_session(self, provider, model, workspace):
-        cursor = self.execute("INSERT INTO sessions (provider, model, workspace, created_at) "
-                              "VALUES (?, ?, ?, ?)", (provider, model, workspace, now()))
-        self.commit()
-        return cursor.lastrowid
+        return self.execute("INSERT INTO sessions (provider, model, workspace, created_at) "
+                            "VALUES (?, ?, ?, ?)", (provider, model, workspace, now()),
+                            commit=True).lastrowid
 
     def add_message(self, session_id, message, active=True):
-        cursor = self.execute(
+        return self.execute(
             "INSERT INTO messages (session_id, active, role, payload, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
-            (session_id, 1 if active else 0, message["role"],
-             json.dumps(message, ensure_ascii=False), now()))
-        self.commit()
-        return cursor.lastrowid
+            (session_id, int(bool(active)), message["role"],
+             json.dumps(message, ensure_ascii=False), now()), commit=True).lastrowid
 
     def last_message_id(self, session_id):
         row = self.execute("SELECT MAX(id) AS newest FROM messages "
@@ -1097,8 +979,7 @@ class Store:
 
     def deactivate(self, session_id, up_to_id):
         self.execute("UPDATE messages SET active = 0 WHERE session_id = ? AND id <= ?",
-                     (session_id, up_to_id))
-        self.commit()
+                     (session_id, up_to_id), commit=True)
 
     def close(self):
         try:
@@ -1128,7 +1009,6 @@ class Agent:
         self.messages = list(messages)  # conversation only, instructions excluded
         self.workspace = Path(workspace).resolve()
         self.permissions = permissions
-        self.tools = Toolbox(self.workspace, permissions)
         self.tools = Toolbox(self.workspace, permissions)
         self.out = out
         self.stream_out = stream_out or (lambda text: print(text, end="", flush=True)
@@ -1329,7 +1209,9 @@ def parse_args(argv):
     parser.add_argument("provider", nargs="?",
                         help="openai, openrouter, deepseek, or an http(s) base URL")
     parser.add_argument("-m", "--model", help="model name to send to the provider")
-    parser.add_argument("-r", "--run", help="run one task, print the answer, and exit")
+    task = parser.add_mutually_exclusive_group()
+    task.add_argument("-r", "--run", help="run one task, print the answer, and exit")
+    task.add_argument("-p", "--prompt", help="one reply without tools or history, then exit")
     parser.add_argument("--permissions", choices=PERMISSIONS,
                         help="auto (default: ask only for actions the guard flags) "
                              "or yolo (skip approval and guard checks)")
@@ -1356,10 +1238,7 @@ def run_interactive(agent):
     while True:
         try:
             line = input(PROMPT)
-        except EOFError:
-            print("")
-            return 0
-        except KeyboardInterrupt:
+        except (EOFError, KeyboardInterrupt):
             print("")
             return 0
         line = line.strip()
@@ -1372,7 +1251,33 @@ def run_interactive(agent):
             agent.run_task(line)
 
 
+def run_prompt(provider, prompt):
+    """One standalone reply: no workspace instructions, saved context, or tools."""
+    streamed = False
+
+    def show(text):
+        nonlocal streamed
+        if text:
+            streamed = True
+            print(text, end="", flush=True)
+
+    try:
+        with WorkingDots(None if provider.streaming else dot_writer()):
+            reply = provider.complete([{"role": "user", "content": prompt}],
+                                      use_tools=False, on_text=show)
+    finally:
+        if streamed:
+            print("")
+    if reply.tool_calls:
+        raise ProviderError("the provider returned tool calls despite tools being disabled")
+    if not streamed:
+        print(reply.text.strip() or "(the model returned no text)")
+    return 0
+
+
 def run_agent(arguments):
+    if arguments.prompt is not None and not arguments.prompt.strip():
+        raise ConfigError("-p/--prompt needs a non-empty prompt")
     settings = load_config(arguments.provider, arguments.model, arguments.permissions,
                            cli_streaming=arguments.streaming)
     provider_name = settings["provider"]
@@ -1382,9 +1287,10 @@ def run_agent(arguments):
     workspace = Path.cwd()
     provider = build_provider(provider_name, settings["model"] or "",
                               streaming=settings["streaming"])
-    store = None
-    try:
-        store = Store(workspace / DB_PATH)
+    if arguments.prompt is not None:
+        with contextlib.closing(provider):
+            return run_prompt(provider, arguments.prompt)
+    with contextlib.closing(provider), contextlib.closing(Store(workspace / DB_PATH)) as store:
         session_id, messages = store.resume(provider.name, provider.model, str(workspace))
         if session_id is None:
             session_id = store.start_session(provider.name, provider.model, str(workspace))
@@ -1408,10 +1314,6 @@ def run_agent(arguments):
                 raise ConfigError("-r/--run needs a non-empty prompt")
             return 0 if agent.run_task(arguments.run) else 1
         return run_interactive(agent)
-    finally:
-        if store is not None:
-            store.close()
-        provider.close()
 
 
 def main(argv=None):

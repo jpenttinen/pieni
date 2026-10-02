@@ -1,22 +1,17 @@
 # pieni
 
-**v0.12** — written by Petri Kuittinen, 2026.
+**v0.13** — written by Petri Kuittinen, 2026.
 
-A tiny AI coding agent written in Python: one file of about 1,440 lines
+A tiny AI coding agent written in Python: one file of about 1,340 lines
 (`pieni.py`) plus a small Bash launcher (`pieni`). It is meant for learning how
-agents work — read it, run it, fork it, change it.
+agents work — read it, run it, fork it, change it. Despite its small size, pieni
+has a minimal sandbox and destructive command guard (DCG). It supports hundreds
+of models and can be extended. It can even generate you games or run web browser.
+Small, but works.
 
 "pieni" is Finnish and means "small".
 
 ## Status
-
-This is the first working release. Headless mode has run successfully against all
-four provider paths: OpenAI, DeepSeek, OpenRouter, and a local OpenAI-compatible
-server. Interactive mode, approval prompts, and manual compaction are implemented
-and covered by the offline tests, but have had less real-terminal use, so treat
-them as the least tested part of v0.12. Streaming is now enabled by default on
-all provider paths and covered by offline mocks and real-SDK loopback tests;
-this change has not been verified against live providers.
 
 Pieni supports these providers (set the API key as an environment variable):
 
@@ -116,11 +111,17 @@ the configured value is preserved.
 ./pieni openai -m "gpt-6-luna" --permissions yolo
 ./pieni openai -m "MODEL" --no-streaming       # wait for a complete reply
 ./pieni deepseek -m "MODEL" --streaming       # override streaming = false
+./pieni openai -m "gpt-6-luna" -p "What is the capital of Finland?"
 ```
 
 Started with no arguments, Pieni prints its banner, usage, and command list, then
 exits with status 0. Give it at least a provider, or set `provider` and `model` in
 `pieni.ini` and pass any other argument.
+
+`-p/--prompt "question"` sends one standalone prompt and exits after the reply.
+It sends only your prompt, with tools disabled, without reading project
+instructions or loading/saving a session. Output is the reply text; the configured
+streaming setting and its CLI overrides apply. `-p` and `-r` are mutually exclusive.
 
 ## Interactive mode
 
@@ -128,7 +129,7 @@ An interactive session greets you with the version banner and the startup state:
 
 ```console
 ./pieni deepseek -m "deepseek-chat"
-Pieni agent v0.12 by Petri Kuittinen
+Pieni agent v0.13 by Petri Kuittinen
 resumed a session with 6 message(s) (deepseek/deepseek-chat)
 permissions: auto
 Type a task, or /help for commands. Ctrl+C interrupts, Ctrl+D exits.
@@ -147,7 +148,7 @@ Headless runs (`-r`) print no banner, so their output stays script-friendly.
 exit code is nonzero when the task could not finish, and actions that would need
 approval are denied instead of waiting for input.
 
-Headless mode is the path verified in v0.12 across all providers:
+Headless mode is the path verified in v0.13 across all providers:
 
 ```console
 ./pieni openai -m "gpt-6-luna" -r "Summarize README.md."
@@ -207,7 +208,7 @@ Every tunable default is a constant near the top of `pieni.py`:
 | `DEFAULT_STREAMING` | `True` | streaming when neither file nor CLI sets it |
 | `DB_PATH` | `.pieni/pieni.db` | saved conversations, under the workspace |
 | `PROMPT` | `pieni> ` | interactive prompt |
-| `VERSION` | `0.12` | shown in the banner |
+| `VERSION` | `0.13` | shown in the banner |
 
 `MAX_READ_LINES` and `MAX_OUTPUT_CHARS` are independent: a `read` returns at most
 5,000 lines, and whatever a tool produces is cut off at 65,536 characters with a
@@ -319,8 +320,9 @@ PYTHONPATH=.venv/lib/python3.12/site-packages python3 -m unittest test_sdk_wire
 
 It skips when the SDKs are not importable.
 
-An optional live smoke test runs one real headless task and is skipped unless you
-opt in with a provider, a model, and the matching API key:
+Optional live smoke tests check streaming and buffered headless tasks, all four
+tools, Unicode files, and session resume. They are skipped unless you opt in with
+a provider and model (plus the matching API key for hosted providers):
 
 ```console
 PIENI_LIVE_PROVIDER=deepseek PIENI_LIVE_MODEL=deepseek-chat \
@@ -328,6 +330,8 @@ PIENI_LIVE_PROVIDER=deepseek PIENI_LIVE_MODEL=deepseek-chat \
 ```
 
 It is not part of the default run and costs whatever your provider charges.
+For a local server, supply its base URL and the model name it serves instead;
+the tests use temporary workspaces.
 
 ## Not included
 

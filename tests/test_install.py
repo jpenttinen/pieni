@@ -5,7 +5,7 @@ the checkout into a temporary directory and installs into a temporary prefix.
 When the dependency check has to be exercised, a stub interpreter on PATH stands
 in for python3, so pip is never invoked.
 
-    python3 -m unittest test_install
+    python3 -m unittest tests.test_install
 """
 
 import os
@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent
+REPO = Path(__file__).resolve().parents[1]
 INSTALLER = REPO / "scripts" / "install.sh"
 BASH = shutil.which("bash")
 

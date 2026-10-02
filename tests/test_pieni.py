@@ -3,7 +3,7 @@
 No network access and no API calls: every provider SDK is replaced by a fake,
 so the default run is free and repeatable. Run with:
 
-    python3 -m unittest test_pieni
+    python3 -m unittest tests.test_pieni
 """
 
 import io
@@ -504,6 +504,19 @@ class BuildProviderTests(unittest.TestCase):
         pieni.build_provider("http://localhost:30000", "qwen", {"OPENAI_API_KEY": "k"})
         self.assertEqual(FakeOpenAI.instances[-1].kwargs.get("api_key"), "k")
 
+    def test_openai_sdk_clients_close_once(self):
+        client = mock.Mock()
+        with mock.patch("pieni.load_sdk", return_value=mock.Mock(return_value=client)):
+            for name, environment in (("openai", {"OPENAI_API_KEY": "k"}),
+                                      ("deepseek", {"DEEPSEEK_API_KEY": "k"}),
+                                      ("http://localhost:30000", {})):
+                with self.subTest(provider=name):
+                    client.close.reset_mock()
+                    provider = pieni.build_provider(name, "m", environment)
+                    provider.close()
+                    provider.close()
+                    client.close.assert_called_once_with()
+
     def test_missing_model_is_reported(self):
         with self.assertRaises(pieni.ConfigError):
             pieni.build_provider("openai", "", {"OPENAI_API_KEY": "k"})
@@ -551,7 +564,7 @@ class GuardTests(unittest.TestCase):
         "ls -la",
         "rm notes.txt",
         "git push origin main",
-        "python3 -m unittest test_pieni",
+        "python3 -m unittest tests.test_pieni",
         "grep -r TODO .",
         "dd --version",
         "echo 'drop the table later'",
@@ -638,6 +651,15 @@ class PermissionTests(TempWorkspaceCase):
 
 class ReadToolTests(TempWorkspaceCase):
 
+    def test_reads_an_empty_file_with_default_range(self):
+        self.write(self.workspace / "empty.txt", "")
+        for arguments in ({"path": "empty.txt"},
+                          {"path": "empty.txt", "start_line": None, "end_line": None}):
+            with self.subTest(arguments=arguments):
+                outcome = self.toolbox().run("read", arguments)
+                self.assertTrue(outcome.ok, outcome.output)
+                self.assertEqual(outcome.output, "empty.txt (0 lines)")
+
     def test_reads_a_whole_file(self):
         self.write(self.workspace / "notes.txt", "first\nsecond\n")
         outcome = self.toolbox().run("read", {"path": "notes.txt"})
@@ -709,6 +731,16 @@ class ReadToolTests(TempWorkspaceCase):
         self.assertTrue(outcome.ok)
         self.assertIn("truncated", outcome.output)
         self.assertLess(len(outcome.output), pieni.MAX_OUTPUT_CHARS + 200)
+
+    def test_truncated_range_preserves_offset_and_selected_count(self):
+        self.write(self.workspace / "big.txt",
+                   "".join(f"line {n}\n" for n in range(pieni.MAX_READ_LINES + 10)))
+        outcome = self.toolbox().run("read", {"path": "big.txt", "start_line": 4})
+        self.assertTrue(outcome.ok, outcome.output)
+        self.assertIn(f"first {pieni.MAX_READ_LINES} of {pieni.MAX_READ_LINES + 7}", outcome.output)
+        self.assertIn("\nline 3\n", outcome.output)
+        self.assertTrue(outcome.output.endswith(f"line {pieni.MAX_READ_LINES + 2}"))
+        self.assertNotIn(f"\nline {pieni.MAX_READ_LINES + 3}", outcome.output)
 
     def test_outside_path_is_denied_in_headless_use(self):
         outside = self.write(self.root / "outside.txt", "secret")
@@ -879,6 +911,46 @@ class ToolArgumentTests(unittest.TestCase):
             with self.subTest(raw=raw):
                 with self.assertRaises(pieni.PieniError):
                     pieni.parse_tool_arguments(raw)
+
+
+class ToolValidationTests(TempWorkspaceCase):
+
+    def test_invalid_required_values_never_reach_permissions_or_tools(self):
+        toolbox = self.toolbox()
+        with mock.patch.object(toolbox.permissions, "check_file") as check_file:
+            with mock.patch.object(toolbox.permissions, "check_shell") as check_shell:
+                for spec in pieni.TOOL_SPECS:
+                    name = spec["name"]
+                    required = spec["parameters"]["required"]
+                    for key in required:
+                        for value in (None, 1, True, []):
+                            with self.subTest(tool=name, key=key, value=value):
+                                arguments = dict.fromkeys(required, "valid")
+                                arguments[key] = value
+                                outcome = toolbox.run(name, arguments)
+                                self.assertFalse(outcome.ok)
+                                self.assertIn(f"argument '{key}' must be a string", outcome.output)
+                check_file.assert_not_called()
+                check_shell.assert_not_called()
+
+    def test_optional_integers_reject_booleans_floats_and_strings(self):
+        toolbox = self.toolbox()
+        for name, key, arguments in (("read", "start_line", {"path": "missing"}),
+                                     ("read", "end_line", {"path": "missing"}),
+                                     ("bash", "timeout", {"command": "true"})):
+            for value in (True, False, 1.5, "1"):
+                with self.subTest(tool=name, key=key, value=value):
+                    outcome = toolbox.run(name, {**arguments, key: value})
+                    self.assertFalse(outcome.ok)
+                    self.assertIn(f"argument '{key}' must be an integer", outcome.output)
+
+    def test_optional_nulls_use_tool_defaults(self):
+        self.write(self.workspace / "notes.txt", "one\ntwo\n")
+        toolbox = self.toolbox()
+        read = toolbox.run("read", {"path": "notes.txt", "start_line": None, "end_line": None})
+        self.assertTrue(read.ok, read.output)
+        self.assertIn("lines 1-2 of 2", read.output)
+        self.assertTrue(toolbox.run("bash", {"command": "true", "timeout": None}).ok)
 
 
 # ---------------------------------------------------------------------------
@@ -1498,6 +1570,26 @@ class CliTests(TempWorkspaceCase):
         self.assertEqual(code, 2)
         self.assertIn("no provider set", stderr.getvalue())
 
+    def test_database_open_failure_still_closes_provider(self):
+        provider = ScriptedProvider([])
+        with self.isolate_config(), mock.patch("pieni.build_provider", return_value=provider):
+            with mock.patch("pieni.Store", side_effect=pieni.PieniError("cannot open database")):
+                with mock.patch.object(provider, "close") as close, redirect_stderr(StringIO()):
+                    self.assertEqual(pieni.main(["openai", "-m", "m", "-r", "hi"]), 1)
+                close.assert_called_once_with()
+
+    def test_database_close_failure_still_closes_provider(self):
+        provider = ScriptedProvider([])
+        store = pieni.Store(self.root / "pieni.db")
+        self.addCleanup(store.close)
+        with self.isolate_config(), mock.patch("pieni.build_provider", return_value=provider):
+            with mock.patch("pieni.Store", return_value=store):
+                with mock.patch.object(store, "close", side_effect=pieni.PieniError("close failed")):
+                    with mock.patch.object(provider, "close") as close:
+                        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                            self.assertEqual(pieni.main(["openai", "-m", "m", "-r", "hi"]), 1)
+                    close.assert_called_once_with()
+
     def test_unknown_provider_is_reported(self):
         stderr = StringIO()
         with self.isolate_config(), redirect_stderr(stderr):
@@ -1631,6 +1723,110 @@ class CliTests(TempWorkspaceCase):
         with mock.patch("builtins.input", return_value="n"), redirect_stdout(StringIO()):
             self.assertFalse(pieni.cli_approve("shell", "rm -rf build", "guard"))
         self.assertIn("[approval needed]", stdout.getvalue())
+
+
+class PromptCliTests(TempWorkspaceCase):
+
+    def setUp(self):
+        super().setUp()
+        self.in_directory(self.workspace)
+
+    def invoke(self, provider, flags):
+        stdout, stderr = StringIO(), StringIO()
+        with mock.patch("pieni.config_paths", return_value=[]):
+            with mock.patch("pieni.build_provider", return_value=provider):
+                with mock.patch("pieni.Store") as store, mock.patch("pieni.Toolbox.run") as run:
+                    with redirect_stdout(stdout), redirect_stderr(stderr):
+                        code = pieni.main([provider.name, "-m", provider.model] + flags)
+                store.assert_not_called()
+                run.assert_not_called()
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_prompt_aliases_and_run_are_mutually_exclusive(self):
+        for option in ("-p", "--prompt"):
+            with self.subTest(option=option):
+                args = pieni.parse_args([option, "question"])
+                self.assertEqual(args.prompt, "question")
+                self.assertIsNone(args.run)
+                with redirect_stderr(StringIO()), self.assertRaises(SystemExit) as caught:
+                    pieni.parse_args([option, "question", "--run", "task"])
+                self.assertEqual(caught.exception.code, 2)
+
+    def test_one_reply_without_tools_for_every_provider_and_streaming_setting(self):
+        question = "What is the capital of Finland? 你好"
+        for kind, name, client_type, body in (
+                ("responses", "openai", FakeResponsesClient, responses_reply("Helsinki")),
+                ("chat", "deepseek", FakeChatClient, chat_reply("Helsinki")),
+                ("custom", "http://localhost:30000", FakeChatClient, chat_reply("Helsinki")),
+                ("openrouter", "openrouter", FakeSendClient, chat_reply("Helsinki"))):
+            for streaming in (True, False):
+                with self.subTest(provider=name, streaming=streaming):
+                    client, close = client_type(body), mock.Mock()
+                    provider = pieni.Provider(name, "m", kind, client, close=close, streaming=streaming)
+                    code, text, error = self.invoke(provider, ["-p", question,
+                        "--streaming" if streaming else "--no-streaming"])
+                    self.assertEqual((code, text, error), (0, "Helsinki\n", ""))
+                    self.assertEqual(len(client.requests), 1)
+                    request = client.requests[0]
+                    self.assertNotIn("tools", request)
+                    self.assertNotIn("instructions", request)
+                    self.assertEqual(request["input" if kind == "responses" else "messages"],
+                                     [{"role": "user", "content": question}])
+                    close.assert_called_once_with()
+        self.assertFalse((self.workspace / ".pieni").exists())
+
+    def test_prompt_ignores_project_instructions_and_preserves_saved_session(self):
+        self.write(self.workspace / "AGENTS.md", "Always inspect the project with tools.")
+        path = self.workspace / pieni.DB_PATH
+        store = pieni.Store(path)
+        session = store.start_session("openai", "m", str(self.workspace))
+        store.add_message(session, {"role": "user", "content": "earlier coding task"})
+        store.close()
+        before = path.read_bytes()
+        client = FakeResponsesClient(responses_reply("Helsinki"))
+        provider = pieni.Provider("openai", "m", "responses", client)
+        self.assertEqual(self.invoke(provider, ["--prompt", "capital?"])[0], 0)
+        self.assertEqual(client.requests[0]["input"], [{"role": "user", "content": "capital?"}])
+        self.assertNotIn("instructions", client.requests[0])
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_empty_prompt_is_rejected_before_creating_client_or_database(self):
+        for prompt in ("", " \n\t"):
+            with self.subTest(prompt=prompt), redirect_stderr(StringIO()) as stderr:
+                with mock.patch("pieni.build_provider") as build, mock.patch("pieni.Store") as store:
+                    self.assertEqual(pieni.main(["openai", "-m", "m", "-p", prompt]), 2)
+                self.assertIn("-p/--prompt needs a non-empty prompt", stderr.getvalue())
+                build.assert_not_called()
+                store.assert_not_called()
+
+    def test_provider_failure_exits_nonzero_and_closes_client(self):
+        close = mock.Mock()
+        client = FakeChatClient(RuntimeError("connection reset"))
+        provider = pieni.Provider("deepseek", "m", "chat", client, close=close)
+        code, text, error = self.invoke(provider, ["-p", "capital?"])
+        self.assertEqual(code, 1)
+        self.assertEqual(text, "")
+        self.assertIn("connection reset", error)
+        self.assertEqual(len(client.requests), 1)
+        close.assert_called_once_with()
+
+    def test_unrequested_tool_call_is_rejected_without_execution(self):
+        client = FakeChatClient(chat_reply(calls=[("c1", "write", '{"path":"new.txt","content":"x"}')]))
+        provider = pieni.Provider("deepseek", "m", "chat", client)
+        code, _, error = self.invoke(provider, ["-p", "capital?"])
+        self.assertEqual(code, 1)
+        self.assertIn("tools being disabled", error)
+        self.assertEqual(len(client.requests), 1)
+        self.assertFalse((self.workspace / "new.txt").exists())
+
+    def test_interruption_closes_client_without_creating_session(self):
+        close = mock.Mock()
+        client = FakeChatClient(KeyboardInterrupt())
+        provider = pieni.Provider("deepseek", "m", "chat", client, close=close)
+        with self.assertRaises(KeyboardInterrupt):
+            self.invoke(provider, ["-p", "capital?"])
+        close.assert_called_once_with()
+        self.assertFalse((self.workspace / ".pieni").exists())
 
 
 class LauncherTests(unittest.TestCase):

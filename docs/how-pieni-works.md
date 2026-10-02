@@ -1,16 +1,21 @@
 # How Pieni works — and how AI harnesses and agents work in general
 
-A model alone cannot do anything. It cannot modify or read files, run commands or access the internet.
-It needs an AI harness to agent to do those tasks and designing your own harness is perhaps among the
-difficult tasks, especially if you plan to support lots of models, providers and plan to have lots of
-features.
+A model alone cannot do anything. It cannot read or change files, run commands, or use
+the internet. To do that it needs an **AI harness**: the program that wraps the model,
+decides what to send it, runs the tools it asks for, and decides what is allowed. A
+model plus a harness is what this guide calls an **agent**. Writing your own harness is
+a reasonable project; making one work with many models, many providers, and many
+features is a large one.
 
-Pieni is a tiny AI agent or AI harness written for education purposes make it perfect
-to study how agentic coding actually work and how to build your own agent. Understanding these
-core things, can make you also more efficient in using other AI agents.
+Pieni is a tiny agent and harness written for education, which makes it a good place to
+study how agentic coding actually works and how to build your own agent. Agentic coding
+means the model works in steps — read a file, run a command, look at the result, decide
+what to do next — instead of answering in one shot. Those steps are the same in the big
+agents, so understanding them here should also help you use those agents more
+deliberately.
 
 Pieni is just [one Python file](../pieni.py), roughly 1,400 lines.
-This guide follows its actual implementation. 
+This guide follows its actual implementation.
 
 ## Contents
 
@@ -45,7 +50,7 @@ on the provider's server. This distinction matters for both debugging and privac
 
 ### Why other agents are much larger
 
-The popular agents, like Codex, Claude Code, and Hermes Agent have over million lines of code or more.
+The popular agents — Codex, Claude Code, Hermes Agent — are built from a million lines of code or more.
 Their surrounding systems include interfaces, integrations, execution policies,
 and long-running state management. Some concrete differences:
 
@@ -62,13 +67,15 @@ and [Hermes's architecture guide](https://hermes-agent.nousresearch.com/docs/dev
 For example, delivering a Hermes task result to a messaging platform requires
 authorization, session routing, and delivery code that Pieni's terminal does not need.
 
-Pieni leaves out most of the components above so it can be small, but it can still do real work
-or even big work, if you let it. Small doesn't mean stupid.
+Pieni leaves out most of the components above so it can stay small. It can still do real
+work: the loop is the same loop, and the model it calls can be as strong as any model you
+point it at. What is missing is the breadth of features and the extra safety layers, so
+small also means less padding when something goes wrong.
 
 ## A tool call, from request to result
 
-Tool calls is what gives the agent ability to do things, like change files, read the file system,
-test the program, run the web browser.
+Tool calls are what let the agent do things: change files, look around the file system, run
+the tests, drive a web browser.
 
 Pieni exposes four tool schemas in `TOOL_SPECS`:
 
@@ -79,9 +86,12 @@ Pieni exposes four tool schemas in `TOOL_SPECS`:
 | `edit` | `path`, `old_text`, `new_text` | Replace exactly one occurrence. Zero or multiple matches are errors. |
 | `bash` | `command`, optional `timeout` | Run a shell command from the workspace and return stdout/stderr. |
 
-A schema says which arguments are required and their types. For example, `read`
-requires a string `path`. `start_line` must be an integer; `true` is not accepted
-as an integer even though Python normally treats booleans as integer subclasses.
+A **schema** is the description of a tool that the model is given: the tool's name, what
+it does, and which arguments it accepts, together with their types. Think of a form with
+labeled boxes. The model fills in the form, and the harness checks it before doing
+anything. For example, `read` requires a string `path`. `start_line` must be an integer;
+`true` is not accepted as an integer even though Python normally treats booleans as
+integer subclasses.
 
 When the model wants to inspect the parser, its reply might contain a tool call.
 After the provider adapter translates it, Pieni's internal representation is:
@@ -111,8 +121,8 @@ For a small file, that result might be:
 
 The next API request includes both the assistant's call and this result. The ID
 connects them; it is especially important when one reply asks for several tools.
-The provider-specific envelopes differ, but this request/result pairing is the
-usual function-calling mechanism. See [OpenAI's function-calling guide](https://developers.openai.com/api/docs/guides/function-calling).
+Each provider writes the call and the result in its own JSON shape, but the
+call/result pairing is the usual function-calling mechanism. See [OpenAI's function-calling guide](https://developers.openai.com/api/docs/guides/function-calling).
 
 If the file does not exist, the tool result contains an error instead. The harness
 does not invent source code to fill the gap. The model can then request a directory
@@ -145,12 +155,29 @@ Useful tools found in larger harnesses but absent here include:
 - Background process tools: start a development server, retain a process ID,
   inspect output, and stop it later.
 - Subagent tools with separate contexts and controlled result sharing.
-- MCP clients exposing external services through discovered tool schemas.
+- MCP (Model Context Protocol) clients, which expose outside services as extra tools the agent can discover at runtime.
 
 Some tasks can be approximated with shell commands. Dedicated tools make the
 arguments, results, lifecycle, and permission checks more explicit. A shell that
 can run arbitrary programs is already powerful; four tool names do not mean four
 narrow capabilities.
+
+Because `bash` runs any shell command the model writes, it is the tool that does most of
+the heavy lifting, and how much it can lift depends entirely on what is installed on that
+particular machine. With nothing but a shell it still gives file inspection, text
+processing, and scripting. Add the usual developer tools and the same tool call can search
+a tree with `grep`, `rg`, or a similar command; download a page with `curl` or `wget`; run
+a test suite; drive a headless browser; or install a package. None of that is implemented
+in `pieni.py`. Pieni hands the command to the shell and returns what comes back, so the
+agent's reach is the machine's reach, not the harness's.
+
+That is also what makes `bash` the most dangerous of the four. `read`, `write`, and `edit`
+each do one thing Pieni can inspect, and the file-tool permission checks cover them. A
+shell command gets none of that treatment: it can fetch and run a script from the
+internet, read files the file tools would refuse, or send your source tree somewhere else,
+without matching a destructive pattern and therefore without an approval prompt in `auto`
+mode. The [destructive-command guard](#the-destructive-command-guard) below is the
+harness's attempt to narrow that gap, and it only reads the command text.
 
 Pieni also has practical limits: `read` returns at most 5,000 lines, tool handlers
 bound output to 65,536 characters, and shell commands default to a 60-second
@@ -216,14 +243,18 @@ and no saved conversation. It makes one model request and exits.
 
 ## File permissions: the minimal sandbox
 
-The phrase “minimal sandbox” needs a qualification: Pieni has application-level
-permission checks for its three file tools, **not containment of the whole agent**.
+A **sandbox** is a boundary that keeps a program away from everything outside an agreed
+area. Strong sandboxes are enforced by the operating system, a container, or a virtual
+machine. Pieni has something much weaker: permission checks in its own Python code,
+covering its three file tools, **not containment of the whole agent**. A command run
+through `bash` is not contained at all.
 
-The workspace is the directory where Pieni starts, not necessarily a Git root or
-the directory containing the installed launcher. In `auto` mode, `read`, `write`,
-and `edit` automatically allow resolved paths inside that workspace and the system
-temporary directory. The latter comes from `tempfile.gettempdir()`, usually `/tmp`
-on Linux; it can differ with the environment or platform.
+The boundary applies to the workspace: the directory where Pieni starts, which is not
+necessarily a Git root or the directory containing the installed launcher. In `auto`
+mode, `read`, `write`, and `edit` automatically allow resolved paths inside that
+workspace and the system temporary directory. The latter comes from
+`tempfile.gettempdir()`, usually `/tmp` on Linux; it can differ with the environment or
+platform.
 
 Assume the workspace is `/home/eye/project` and the temp directory is `/tmp`:
 
@@ -332,9 +363,11 @@ to confuse:
 2. Compaction preparation trims tool data before a summary request.
 3. A model-written summary replaces the active conversation after `/compact`.
 
-Pieni does not automatically compact near a model's limit. Its displayed
-1,000,000-token context window is an assumption for the display, not discovered
-model capacity. The context count is a rough character-based estimate.
+Pieni does not automatically compact near a model's limit. Two terms matter here: a
+**token** is a piece of text, about four characters of English on average, and the
+**context window** is how many tokens a model can read in one request. The
+1,000,000-token window Pieni displays is an assumption for the display, not discovered
+model capacity, and the context count is a rough character-based estimate.
 
 ### What `/compact` actually does
 
@@ -431,6 +464,8 @@ text, not a portable way to preserve a model's reasoning state.
 
 ### The three wire formats
 
+A wire format is the exact JSON shape an API expects.
+
 | Provider selection | SDK and call | Translation |
 | --- | --- | --- |
 | `openai` | `openai`: `client.responses.create()` | System text becomes `instructions`; conversation becomes `input` items. Tools use a flat function definition. |
@@ -438,7 +473,7 @@ text, not a portable way to preserve a model's reasoning state.
 | `openrouter` | `openrouter`: `client.chat.send()` | Shares Pieni's Chat Completions conversion and reply handling; key from `OPENROUTER_API_KEY`. |
 | An HTTP(S) URL | `openai`: Chat Completions at that base URL | Same conversion as DeepSeek; `OPENAI_API_KEY` if set, otherwise a placeholder for local servers. |
 
-Here is the same tool result on two wire formats:
+Here is the same tool result written in two of them:
 
 ```json
 {

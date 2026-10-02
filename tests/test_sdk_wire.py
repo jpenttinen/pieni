@@ -85,6 +85,9 @@ def stream_payload(body):
         base["object"] = "chat.completion.chunk"
         message = body["choices"][0]["message"]
         delta = {"role": "assistant", "content": message.get("content")}
+        for key in pieni.REASONING_FIELDS:
+            if key in message:
+                delta[key] = message[key]
         fragments = []
         for index, call in enumerate(message.get("tool_calls", [])):
             arguments = call["function"]["arguments"]
@@ -359,6 +362,89 @@ class OpenRouterTests(unittest.TestCase):
         self.assertTrue(created[-1].exited)
 
 
+class ReasoningWireTests(unittest.TestCase):
+    @unittest.skipUnless(HAVE_OPENAI, "the openai SDK is not installed")
+    def test_effort_fields_through_responses_custom_and_deepseek_sdks(self):
+        from openai import OpenAI
+
+        for kind in ("responses", "custom", "chat"):
+            body = responses_body(text="done") if kind == "responses" else chat_body(text="done")
+            recorder = Recorder([body] * 6)
+            with LoopbackServer(recorder) as server:
+                with OpenAI(api_key="test", base_url=server.url) as client:
+                    for streaming in (False, True):
+                        for effort in ("default", "none", "high"):
+                            with self.subTest(kind=kind, streaming=streaming, effort=effort):
+                                provider = pieni.Provider(kind, "m", kind, client,
+                                                          streaming=streaming, reasoning=effort)
+                                self.assertEqual(provider.complete([
+                                    {"role": "user", "content": "hello"}]).text, "done")
+                                request = recorder.requests[-1]["json"]
+                                if effort == "default":
+                                    for key in ("reasoning", "reasoning_effort", "thinking"):
+                                        self.assertNotIn(key, request)
+                                elif kind == "responses":
+                                    self.assertEqual(request["reasoning"], {"effort": effort})
+                                elif kind == "custom":
+                                    self.assertEqual(request["reasoning_effort"], effort)
+                                else:
+                                    self.assertEqual(request["thinking"], {
+                                        "type": "disabled" if effort == "none" else "enabled"})
+                                    if effort == "none":
+                                        self.assertNotIn("reasoning_effort", request)
+                                    else:
+                                        self.assertEqual(request["reasoning_effort"], effort)
+
+    @unittest.skipUnless(HAVE_OPENAI, "the openai SDK is not installed")
+    def test_deepseek_full_reasoning_round_trip_with_real_sdk(self):
+        from openai import OpenAI
+
+        secret = "完整 reasoning\n" * 200
+        for streaming in (False, True):
+            first_body = chat_body(calls=[("call_1", "bash", '{"command":"true"}')])
+            first_body["choices"][0]["message"]["reasoning_content"] = secret
+            recorder = Recorder([first_body, chat_body(text="done")])
+            with LoopbackServer(recorder) as server:
+                with OpenAI(api_key="test", base_url=server.url) as client:
+                    provider = pieni.Provider("deepseek", "m", "chat", client,
+                                              streaming=streaming, reasoning="high")
+                    messages = [{"role": "user", "content": "hello"}]
+                    first = provider.complete(messages)
+                    provider.complete(messages + [pieni.assistant_message(first),
+                                      pieni.tool_message("call_1", "bash", "ok")])
+            self.assertEqual(recorder.requests[1]["json"]["messages"][1]["reasoning_content"], secret)
+
+    @unittest.skipUnless(HAVE_OPENROUTER, "the openrouter SDK is not installed")
+    def test_openrouter_effort_and_reasoning_blocks_round_trip_with_real_sdk(self):
+        from openrouter import OpenRouter
+
+        details = [{"type": "reasoning.text", "text": "thinking", "signature": "sig",
+                    "index": 0, "format": "anthropic-claude-v1"},
+                   {"type": "reasoning.encrypted", "data": "opaque", "index": 1,
+                    "format": "anthropic-claude-v1"}]
+        for streaming in (False, True):
+            first_body = chat_body(calls=[("call_1", "bash", '{"command":"true"}')])
+            first_body["choices"][0]["message"].update(reasoning="thinking", reasoning_details=details)
+            recorder = Recorder([first_body, chat_body(text="done"), chat_body(text="default")])
+            with LoopbackServer(recorder) as server:
+                with OpenRouter(api_key="test", server_url=server.url) as client:
+                    provider = pieni.Provider("openrouter", "m", "openrouter", client,
+                                              streaming=streaming, reasoning="high")
+                    messages = [{"role": "user", "content": "hello"}]
+                    first = provider.complete(messages)
+                    provider.reasoning = "none"
+                    provider.complete(messages + [pieni.assistant_message(first),
+                                      pieni.tool_message("call_1", "bash", "ok")])
+                    provider.reasoning = "default"
+                    provider.complete(messages)
+            self.assertEqual(recorder.requests[0]["json"]["reasoning"], {"effort": "high"})
+            self.assertEqual(recorder.requests[1]["json"]["reasoning"], {"effort": "none"})
+            followup = recorder.requests[1]["json"]["messages"][1]
+            self.assertEqual(followup["reasoning"], "thinking")
+            self.assertEqual(followup["reasoning_details"], details)
+            self.assertNotIn("reasoning", recorder.requests[2]["json"])
+
+
 @unittest.skipUnless(HAVE_OPENAI, "the openai SDK is not installed")
 class EndToEndTests(unittest.TestCase):
     """The whole program — loop, tools, database, display — with the real SDK."""
@@ -381,7 +467,7 @@ class EndToEndTests(unittest.TestCase):
                             os.chdir(directory)
                             with redirect_stdout(stdout):
                                 code = pieni.main(["openai", "-m", "test-model",
-                                                   "-r", "print the marker"])
+                                                   "-r", "print the marker", "--reasoning", "high"])
                         finally:
                             os.chdir(previous)
                 database = os.path.join(directory, ".pieni", "pieni.db")
@@ -389,6 +475,8 @@ class EndToEndTests(unittest.TestCase):
 
         text = stdout.getvalue()
         self.assertEqual(code, 0, text)
+        for request in recorder.requests:
+            self.assertEqual(request["json"]["reasoning"], {"effort": "high"})
         # The bash tool really ran, and its result went back to the model.
         self.assertRegex(text, r'bash\(command="echo real-sdk-ok"\) -> ok, \d+ ms')
         self.assertIn("the command printed real-sdk-ok", text)

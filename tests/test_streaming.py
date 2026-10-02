@@ -62,7 +62,7 @@ class StreamingConfigTests(fixtures.TempWorkspaceCase):
                     with mock.patch("pieni.build_provider", return_value=provider) as build:
                         with redirect_stdout(StringIO()):
                             self.assertEqual(pieni.main(["-r", "hi"] + flags), 0)
-                build.assert_called_once_with("openai", "m", streaming=expected)
+                build.assert_called_once_with("openai", "m", streaming=expected, reasoning="default")
 
     def test_all_provider_paths_default_to_streaming_and_allow_disable(self):
         sdks = {"openai": SimpleNamespace(OpenAI=fixtures.FakeOpenAI),
@@ -197,7 +197,7 @@ class StreamingLoopTests(fixtures.TempWorkspaceCase):
         agent.stream_out = raw.append
         return agent, store, output, raw, stream, send
 
-    def test_streamed_text_displayed_once_and_saved_without_reasoning(self):
+    def test_streamed_text_displayed_once_and_deepseek_reasoning_saved_for_replay(self):
         agent, store, output, raw, stream, _ = self.make_streaming_agent([
             chunk({"content": "你", "reasoning_content": "inspect files"}),
             chunk({"content": "好 مرحبا"}), chunk(finish="stop"),
@@ -209,7 +209,8 @@ class StreamingLoopTests(fixtures.TempWorkspaceCase):
         self.assertEqual(agent.messages[-1]["content"], "你好 مرحبا")
         _, saved = store.resume(fixtures.ScriptedProvider.name, fixtures.ScriptedProvider.model,
                                 str(self.workspace))
-        self.assertNotIn("inspect files", json.dumps(saved))
+        self.assertEqual(saved[-1]["reasoning_content"], "inspect files")
+        self.assertNotIn("thinking:", json.dumps(saved))
         self.assertTrue(stream.closed)
         self.assertIn("Tokens: ~", output[-1])
 

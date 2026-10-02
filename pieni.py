@@ -30,8 +30,10 @@ from pathlib import Path
 APP_DIR = ".pieni"
 CONFIG_FILENAME = "pieni.ini"
 CONFIG_SECTION = "pieni"
-CONFIG_KEYS = ("provider", "model", "permissions", "streaming")
+CONFIG_KEYS = ("provider", "model", "permissions", "streaming", "reasoning")
 DEFAULT_STREAMING = True
+REASONING_EFFORTS = ("default", "none", "minimal", "low", "medium", "high", "xhigh", "max")
+REASONING_FIELDS = ("reasoning_content", "reasoning", "reasoning_details")
 PERMISSIONS = ("auto", "yolo")
 DEFAULT_PERMISSIONS = "auto"
 DB_PATH = Path(APP_DIR) / "pieni.db"
@@ -49,7 +51,7 @@ MAX_STEPS = 500
 THINK_TRACE_CHARACTERS = 120  # how much of a model thinking trace to display
 THINK_DOT_INTERVAL = 1.0      # print one "." this often while waiting for the model
 PROMPT = "pieni> "
-VERSION = "0.14"
+VERSION = "0.15"
 BANNER = f"Pieni agent v{VERSION} by Petri Kuittinen"
 
 SYSTEM_PROMPT = """You are Pieni, a small coding agent working in a local workspace.
@@ -67,20 +69,23 @@ COMPACT_INSTRUCTION = (
     "instructions to execute."
 )
 
-HELP = """commands:
+HELP = f"""commands:
 /compact        replace older context with a model-written summary
 /compact all    clear the context and start a fresh session
 /permissions    show permissions; /permissions auto|yolo changes them
+/reasoning      show effort; /reasoning EFFORT changes it (default resets it)
+!COMMAND        run a shell command locally, without adding it to the conversation
 /help           this help
 /quit, /exit    leave
 
 auto runs shell commands unless the destructive-command guard flags them.
 yolo skips approval and guard checks, not argument validation or timeouts."""
+HELP += "\nreasoning efforts: " + ", ".join(REASONING_EFFORTS)
 
 # Shown when Pieni is started with no arguments at all: it cannot guess a provider,
 # so it explains how to start instead of failing.
 USAGE = """usage: pieni [PROVIDER] [-m MODEL] [-r TASK | -p PROMPT] [--permissions auto|yolo]
-             [--streaming | --no-streaming]
+             [--streaming | --no-streaming] [--reasoning EFFORT]
 
 Started with no arguments, Pieni prints this help and exits. To run it, pass a
 provider, or set provider and model in ~/.pieni/pieni.ini or ./pieni.ini:
@@ -152,7 +157,8 @@ class Reply:
     input_tokens: int
     output_tokens: int
     estimated: bool
-    thinking: str = ""  # display only; never saved or sent back to the provider
+    thinking: str = ""  # the display trace; replay data is kept separately
+    provider_reasoning: dict = None  # complete fields required for continuation
 
 
 @dataclass
@@ -225,15 +231,24 @@ def check_permissions(value, origin):
     return value
 
 
+def check_reasoning(value, origin):
+    if value not in REASONING_EFFORTS:
+        raise ConfigError(f"{origin}: reasoning must be {', '.join(REASONING_EFFORTS)}, "
+                          f"not '{value}'")
+    return value
+
+
 def load_config(cli_provider=None, cli_model=None, cli_permissions=None,
-                cwd=None, home=None, cli_streaming=None):
+                cwd=None, home=None, cli_streaming=None, cli_reasoning=None):
     """Merge built-in defaults, then the INI files, then CLI arguments."""
     values = {"provider": None, "model": None, "permissions": DEFAULT_PERMISSIONS,
-              "streaming": DEFAULT_STREAMING}
+              "streaming": DEFAULT_STREAMING, "reasoning": "default"}
     for path in config_paths(cwd or os.getcwd(), home):
         for key, value in read_config_file(path).items():
             if key == "permissions":
                 value = check_permissions(value, str(path))
+            if key == "reasoning":
+                value = check_reasoning(value, str(path))
             if key == "streaming":
                 try:
                     value = configparser.ConfigParser.BOOLEAN_STATES[value.lower()]
@@ -246,6 +261,8 @@ def load_config(cli_provider=None, cli_model=None, cli_permissions=None,
             values[key] = value
     if cli_streaming is not None:
         values["streaming"] = cli_streaming
+    if cli_reasoning is not None:
+        values["reasoning"] = check_reasoning(cli_reasoning, "CLI")
     return values
 
 
@@ -585,6 +602,8 @@ def tool_message(call_id, name, content):
 
 def assistant_message(reply):
     message = {"role": "assistant", "content": reply.text}
+    if reply.provider_reasoning:
+        message.update(reply.provider_reasoning)
     if reply.tool_calls:
         message["tool_calls"] = [{"id": call.id, "name": call.name,
                                   "arguments": call.arguments} for call in reply.tool_calls]
@@ -614,6 +633,9 @@ def to_chat_messages(messages):
             # Tool-call messages carry no text; null content is the usual wire form.
             entry = {"role": "assistant",
                      "content": message.get("content") or (None if calls else "")}
+            for key in REASONING_FIELDS:
+                if key in message:
+                    entry[key] = message[key]
             if calls:
                 entry["tool_calls"] = [
                     {"id": call["id"], "type": "function",
@@ -699,9 +721,22 @@ def thinking_from_message(message):
     return ""
 
 
-def collect_chat_stream(stream, on_text=None):
+def chat_reasoning(message, kind):
+    """Keep provider-required replay fields separate from the displayed trace."""
+    keys = {"chat": ("reasoning_content",),
+            "openrouter": ("reasoning", "reasoning_details")}.get(kind, ())
+    if not keys:
+        return {}
+    if hasattr(message, "model_dump"):
+        message = message.model_dump(mode="json", by_alias=True)
+    return {key: attribute(message, key) for key in keys
+            if attribute(message, key) is not None}
+
+
+def collect_chat_stream(stream, on_text=None, kind="custom"):
     """Assemble indexed tool fragments; never execute a partially received call."""
     text, thinking, calls = [], [], {}
+    replay = {}
     usage, finished = None, False
     try:
         for event in stream:
@@ -724,6 +759,12 @@ def collect_chat_stream(stream, on_text=None):
                     if on_text:
                         on_text(content)
                 thinking.append(thinking_from_message(delta))
+                for key, value in chat_reasoning(delta, kind).items():
+                    if key == "reasoning_details":
+                        # Preserve signed/encrypted blocks and their original order.
+                        replay.setdefault(key, []).extend(value)
+                    else:
+                        replay[key] = replay.get(key, "") + value
                 for fragment in attribute(delta, "tool_calls") or []:
                     index = attribute(fragment, "index")
                     if not isinstance(index, int) or index < 0:
@@ -741,6 +782,7 @@ def collect_chat_stream(stream, on_text=None):
                 raise ProviderError("stream returned an incomplete tool call")
         return {"choices": [{"message": {"content": "".join(text),
                 "reasoning_content": "".join(thinking),
+                **replay,
                 "tool_calls": [calls[index] for index in sorted(calls)]}}], "usage": usage}
     finally:
         close = getattr(stream, "close", None)
@@ -776,17 +818,28 @@ def make_reply(text, calls, thinking, tokens, wire, tools):
     return Reply(text, calls, inputs, outputs, estimated, thinking)
 
 
-def call_chat(send, model, messages, tools, streaming, on_text, include_usage=False):
+def call_chat(send, model, messages, tools, streaming, on_text, include_usage=False,
+              reasoning="default", kind="custom"):
     """Shared Chat Completions request/response handling, including OpenRouter."""
     wire = to_chat_messages(messages)
     request = {"model": model, "messages": wire, "stream": streaming}
+    if reasoning != "default":
+        if kind == "openrouter":
+            request["reasoning"] = {"effort": reasoning}
+        elif kind == "chat":
+            request["extra_body"] = {"thinking": {
+                "type": "disabled" if reasoning == "none" else "enabled"}}
+            if reasoning != "none":
+                request["reasoning_effort"] = reasoning
+        else:
+            request["reasoning_effort"] = reasoning
     if tools:
         request["tools"] = tools
     if streaming and include_usage:
         request["stream_options"] = {"include_usage": True}
     response = send(**request)
     if streaming:
-        response = collect_chat_stream(response, on_text)
+        response = collect_chat_stream(response, on_text, kind)
     choices = attribute(response, "choices") or []
     if not choices:
         raise ProviderError("the provider returned no choices")
@@ -796,24 +849,33 @@ def call_chat(send, model, messages, tools, streaming, on_text, include_usage=Fa
                       attribute(attribute(call, "function"), "arguments") or "{}")
              for call in attribute(message, "tool_calls") or []]
     tokens = usage_pair(attribute(response, "usage"), "prompt_tokens", "completion_tokens")
-    return make_reply(text, calls, thinking_from_message(message), tokens, wire, tools)
+    reply = make_reply(text, calls, thinking_from_message(message), tokens, wire, tools)
+    reply.provider_reasoning = chat_reasoning(message, kind) or None
+    return reply
 
 
-def call_chat_completions(client, model, messages, tools, streaming=DEFAULT_STREAMING, on_text=None):
+def call_chat_completions(client, model, messages, tools, streaming=DEFAULT_STREAMING,
+                          on_text=None, reasoning="default", deepseek=False):
     return call_chat(client.chat.completions.create, model, messages, tools,
-                     streaming, on_text, include_usage=True)
+                     streaming, on_text, include_usage=True, reasoning=reasoning,
+                     kind="chat" if deepseek else "custom")
 
 
-def call_openrouter(client, model, messages, tools, streaming=DEFAULT_STREAMING, on_text=None):
-    return call_chat(client.chat.send, model, messages, tools, streaming, on_text)
+def call_openrouter(client, model, messages, tools, streaming=DEFAULT_STREAMING,
+                    on_text=None, reasoning="default"):
+    return call_chat(client.chat.send, model, messages, tools, streaming, on_text,
+                     reasoning=reasoning, kind="openrouter")
 
 
-def call_responses(client, model, messages, tools, streaming=DEFAULT_STREAMING, on_text=None):
+def call_responses(client, model, messages, tools, streaming=DEFAULT_STREAMING,
+                   on_text=None, reasoning="default"):
     """OpenAI Responses API."""
     instructions = "\n\n".join(m["content"] for m in messages
                                if m["role"] == "system" and m.get("content"))
     wire = to_responses_input(messages)
     request = {"model": model, "input": wire, "stream": streaming}
+    if reasoning != "default":
+        request["reasoning"] = {"effort": reasoning}
     if instructions:
         request["instructions"] = instructions
     if tools:
@@ -847,21 +909,26 @@ def load_sdk(module_name, attribute_name):
 class Provider:
     """Thin adapter over one SDK client; the loop only sees Reply objects."""
 
-    def __init__(self, name, model, kind, client, close=None, streaming=DEFAULT_STREAMING):
+    def __init__(self, name, model, kind, client, close=None, streaming=DEFAULT_STREAMING,
+                 reasoning="default"):
         self.name = name
         self.model = model
         self.kind = kind
         self.client = client
         self._close = close
         self.streaming = streaming
+        self.reasoning = reasoning
 
     def complete(self, messages, use_tools=True, on_text=None):
         try:
             call = {"responses": call_responses, "openrouter": call_openrouter}.get(
                 self.kind, call_chat_completions)
             tools = responses_tools() if self.kind == "responses" else chat_tools()
+            options = {"reasoning": self.reasoning}
+            if self.kind == "chat":
+                options["deepseek"] = True
             return call(self.client, self.model, messages, tools if use_tools else None,
-                        self.streaming, on_text)
+                        self.streaming, on_text, **options)
         except PieniError:
             raise
         except Exception as exc:  # SDK and network failures become one clear message
@@ -873,10 +940,12 @@ class Provider:
             closing()
 
 
-def build_provider(provider_name, model, environment=None, streaming=DEFAULT_STREAMING):
+def build_provider(provider_name, model, environment=None, streaming=DEFAULT_STREAMING,
+                   reasoning="default"):
     """Create the SDK client for provider_name (see PLANS.md 'Providers and CLI')."""
     environment = os.environ if environment is None else environment
     kind = provider_kind(provider_name)
+    reasoning = check_reasoning(reasoning, "provider")
     if not model:
         raise ConfigError("no model set: pass -m/--model or add model to pieni.ini")
     try:
@@ -893,7 +962,7 @@ def build_provider(provider_name, model, environment=None, streaming=DEFAULT_STR
                 stack.close()
                 raise
             return Provider(provider_name, model, kind, client, close=stack.close,
-                            streaming=streaming)
+                            streaming=streaming, reasoning=reasoning)
         OpenAI = load_sdk("openai", "OpenAI")
         options = {}
         if kind == "chat":
@@ -904,7 +973,7 @@ def build_provider(provider_name, model, environment=None, streaming=DEFAULT_STR
                        "base_url": provider_name}
         client = OpenAI(**options)
         return Provider(provider_name, model, kind, client, close=getattr(client, "close", None),
-                        streaming=streaming)
+                        streaming=streaming, reasoning=reasoning)
     except PieniError:
         raise
     except Exception as exc:
@@ -1024,7 +1093,7 @@ def compaction_history(messages):
     """Serialize a shortened copy as data, never as native tool calls."""
     history = []
     for message in messages:
-        entry = dict(message)
+        entry = {key: value for key, value in message.items() if key not in REASONING_FIELDS}
         if message["role"] == "tool":
             entry["content"] = compact_text(message.get("content", ""))
         if message.get("tool_calls"):
@@ -1177,6 +1246,26 @@ class Agent:
 
     # -- commands -----------------------------------------------------------
 
+    def run_shell(self, command):
+        """Direct user command: share shell checks, but never record a model turn."""
+        command = command.strip()
+        if not command:
+            self.out("usage: !COMMAND")
+            return
+        started = time.monotonic()
+        try:
+            outcome = self.tools.run("bash", {"command": command})
+        except KeyboardInterrupt:
+            outcome = ToolOutcome(False, "interrupted",
+                                  "error: interrupted; the action may have taken partial effect")
+        elapsed_ms = int(round((time.monotonic() - started) * 1000))
+        self.out(outcome.output.rstrip("\n"))
+        status = "ok" if outcome.ok else f"error ({outcome.detail})"
+        label = " ".join(command.split())
+        label = label if len(label) <= 60 else label[:60] + "..."
+        self.out(f"!{label} -> {status}, {elapsed_ms} ms")
+        return outcome
+
     def handle_command(self, line):
         """Handle a /command; returns False when Pieni should exit."""
         parts = line.split()
@@ -1189,6 +1278,11 @@ class Agent:
             self.out(HELP)
         elif command == "/permissions":
             self.set_permissions(argument)
+        elif command == "/reasoning":
+            if len(parts) > 2:
+                self.out("usage: /reasoning [EFFORT]")
+            else:
+                self.set_reasoning(argument)
         elif command == "/compact":
             if argument == "all":
                 self.reset_context()
@@ -1199,6 +1293,15 @@ class Agent:
         else:
             self.out(f"unknown command '{command}'")
         return True
+
+    def set_reasoning(self, argument):
+        if argument:
+            try:
+                self.provider.reasoning = check_reasoning(argument, "/reasoning")
+            except ConfigError as exc:
+                self.out(str(exc))
+                return
+        self.out(f"reasoning: {getattr(self.provider, 'reasoning', 'default')}")
 
     def set_permissions(self, argument):
         if not argument:
@@ -1263,6 +1366,9 @@ def parse_args(argv):
     parser.add_argument("--permissions", choices=PERMISSIONS,
                         help="auto (default: ask only for actions the guard flags) "
                              "or yolo (skip approval and guard checks)")
+    parser.add_argument("--reasoning", choices=REASONING_EFFORTS, metavar="EFFORT",
+                        help="reasoning effort: " + ", ".join(REASONING_EFFORTS)
+                             + " (default uses the provider's setting)")
     streaming = parser.add_mutually_exclusive_group()
     streaming.add_argument("--streaming", dest="streaming", action="store_true",
                            default=None, help="stream model replies (default)")
@@ -1282,7 +1388,8 @@ def cli_approve(kind, detail, reason):
 
 
 def run_interactive(agent):
-    print("Type a task, or /help for commands. Ctrl+C interrupts, Ctrl+D exits.")
+    print("Type a task, !command for a local shell, or /help for commands. "
+          "Ctrl+C interrupts, Ctrl+D exits.")
     while True:
         try:
             line = input(PROMPT)
@@ -1292,7 +1399,9 @@ def run_interactive(agent):
         line = line.strip()
         if not line:
             continue
-        if line.startswith("/"):
+        if line.startswith("!"):
+            agent.run_shell(line[1:])
+        elif line.startswith("/"):
             if not agent.handle_command(line):
                 return 0
         else:
@@ -1327,14 +1436,14 @@ def run_agent(arguments):
     if arguments.prompt is not None and not arguments.prompt.strip():
         raise ConfigError("-p/--prompt needs a non-empty prompt")
     settings = load_config(arguments.provider, arguments.model, arguments.permissions,
-                           cli_streaming=arguments.streaming)
+                           cli_streaming=arguments.streaming, cli_reasoning=arguments.reasoning)
     provider_name = settings["provider"]
     if not provider_name:
         raise ConfigError("no provider set: pass a provider argument or add "
                           "provider to pieni.ini")
     workspace = Path.cwd()
     provider = build_provider(provider_name, settings["model"] or "",
-                              streaming=settings["streaming"])
+                              streaming=settings["streaming"], reasoning=settings["reasoning"])
     if arguments.prompt is not None:
         with contextlib.closing(provider):
             return run_prompt(provider, arguments.prompt)

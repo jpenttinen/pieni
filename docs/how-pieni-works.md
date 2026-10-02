@@ -14,7 +14,7 @@ what to do next — instead of answering in one shot. Those steps are the same i
 agents, so understanding them here should also help you use those agents more
 deliberately.
 
-Pieni is just [one Python file](../pieni.py), roughly 1,400 lines.
+Pieni is just [one Python file](../pieni.py), with about 1500 lines of code.
 This guide follows its actual implementation.
 
 ## Contents
@@ -455,12 +455,26 @@ internal messages and tool definitions into an API request, then normalizes the
 reply into:
 
 ```python
-Reply(text, tool_calls, input_tokens, output_tokens, estimated, thinking)
+Reply(text, tool_calls, input_tokens, output_tokens, estimated, thinking, provider_reasoning)
 ```
 
 `tool_calls` contains `ToolCall` objects. If the provider reports usage, Pieni uses
 it; otherwise it labels a simple estimate. `thinking` is optional display-only
-text, not a portable way to preserve a model's reasoning state.
+text, not a portable way to preserve a model's reasoning state. The optional
+`provider_reasoning` dictionary holds full DeepSeek `reasoning_content` or
+OpenRouter reasoning fields and ordered blocks. Those fields are saved with
+assistant messages and replayed for tool continuation and resume; compaction
+omits them from its summary input.
+
+`--reasoning EFFORT`, the INI `reasoning` key, and `/reasoning EFFORT` control
+effort on subsequent requests. `default` omits the effort parameter and lets
+the provider choose; runtime changes do not edit configuration or session settings.
+The adapters translate the setting to each provider's request fields.
+
+Different models support different reasoning effort settings and defaults.
+Some older models have no reasoning mode at all; changing effort cannot give
+them one. Use `default` when the model does not support effort controls, since
+an explicit unsupported value may cause a provider error.
 
 ### The three wire formats
 
@@ -579,6 +593,11 @@ Use function names rather than fixed line numbers, which change as the file does
 system prompt. Pieni does not recursively discover nested instruction files.
 Configuration is user INI first, launch-directory INI second, explicit CLI values
 last. Those are harness decisions, not behaviors learned by the model.
+
+Interactive input beginning with `!` runs directly through the existing shell
+tool, with the same permissions, timeout, and output limits. The terminal shows
+stdout/stderr, success or exit code, and elapsed milliseconds. These commands
+do not call the model or enter the saved conversation.
 
 Run the default offline suite from the checkout:
 

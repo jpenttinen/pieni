@@ -76,6 +76,10 @@ def fake_chat_stream(response):
                           "function": pieni.attribute(call, "function")})
         delta = {"content": pieni.attribute(message, "content"), "tool_calls": calls,
                  "reasoning_content": pieni.thinking_from_message(message)}
+        for key in pieni.REASONING_FIELDS:
+            value = pieni.attribute(message, key)
+            if value is not None:
+                delta[key] = value
         events.append({"choices": [{"index": 0, "delta": delta,
                                    "finish_reason": "tool_calls" if calls else "stop"}]})
     events.append({"choices": [], "usage": pieni.attribute(response, "usage")})
@@ -216,7 +220,8 @@ class ConfigTests(TempWorkspaceCase):
 
     def test_defaults_when_no_file_exists(self):
         settings = pieni.load_config(cwd=self.workspace, home=self.home)
-        self.assertEqual(settings, {"provider": None, "model": None, "permissions": "auto", "streaming": True})
+        self.assertEqual(settings, {"provider": None, "model": None, "permissions": "auto",
+                                    "streaming": True, "reasoning": "default"})
 
     def test_local_file_overrides_user_file_per_key(self):
         self.write(self.home / ".pieni" / "pieni.ini",
@@ -231,7 +236,8 @@ class ConfigTests(TempWorkspaceCase):
         self.write(self.home / ".pieni" / "pieni.ini", "[pieni]\nprovider = openai\n")
         self.write(self.workspace / "pieni.ini", "[pieni]\nprovider = openrouter\nmodel = a\n")
         settings = pieni.load_config("deepseek", "b", "yolo", cwd=self.workspace, home=self.home)
-        self.assertEqual(settings, {"provider": "deepseek", "model": "b", "permissions": "yolo", "streaming": True})
+        self.assertEqual(settings, {"provider": "deepseek", "model": "b", "permissions": "yolo",
+                                    "streaming": True, "reasoning": "default"})
 
     def test_missing_home_directory_is_fine(self):
         settings = pieni.load_config(cwd=self.workspace, home=self.root / "nope")

@@ -64,12 +64,19 @@ Provide a small Bash launcher named `pieni`; tests live in separate Python files
 - Merge settings per key: local values override user values; omitted local keys
   retain user values. Explicit CLI arguments override both files; built-in
   defaults apply only when neither file nor CLI supplies a value.
-- Keep one `[pieni]` section with `provider`, `model`, `permissions`, and `streaming`
+- Keep one `[pieni]` section with `provider`, `model`, `permissions`, `streaming`, and `reasoning`
   settings. Provider/model may come from configuration instead of CLI arguments;
   report a clear error if either is still missing. Default permissions remain
   `auto`. Streaming defaults to `true` for every provider/model, including custom
   endpoints. Accept standard INI booleans (`true/false`, `yes/no`, `on/off`, `1/0`);
   reject invalid values clearly.
+- Reasoning defaults to `default`, omitting the effort parameter. Accept `none`,
+  `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`, plus `default` to reset.
+  `--reasoning EFFORT` overrides INI settings for every interface and request,
+  including compaction. Unsupported model settings fail without fallback retries.
+  Send `reasoning.effort` on Responses and OpenRouter, and `reasoning_effort` on
+  custom Chat Completions. DeepSeek uses `thinking.type = disabled` for `none`;
+  other explicit efforts enable thinking and set `reasoning_effort`.
 - Missing files are fine. Report unreadable files, malformed INI, and invalid
   settings clearly. Read UTF-8 and disable interpolation to keep values literal.
 - API keys remain in environment variables, not configuration files. No config
@@ -127,9 +134,10 @@ Provide a small Bash launcher named `pieni`; tests live in separate Python files
   When streaming is disabled, show progress while waiting: one `.` per
   `THINK_DOT_INTERVAL` second, only on an interactive terminal, followed by a newline
   before the next line. Show a completed reply's thinking trace as one line cut to
-  `THINK_TRACE_CHARACTERS` characters. Thinking is display-only: it is not added to
-  the conversation, saved, or sent back to the provider; live reasoning remains
-  deferred.
+  `THINK_TRACE_CHARACTERS` characters. The displayed trace is not saved separately.
+  Preserve complete DeepSeek `reasoning_content` and OpenRouter reasoning fields
+  and ordered blocks in assistant messages for tool continuation and SQLite resume;
+  omit those fields from compaction input. Live reasoning remains deferred.
 - After each tool call finishes, display its name/arguments, `ok` or `error`
   (with a short cause), and elapsed time in milliseconds, for example:
   `read(path="pieni.py") -> ok, 12 ms`. Denied, failed, timed-out, and interrupted
@@ -157,6 +165,14 @@ Provide a small Bash launcher named `pieni`; tests live in separate Python files
     conversation context only after a successful response.
   - `/compact all`: clear conversation context and start a fresh session.
   - `/permissions auto|yolo`: change permissions.
+  - `/reasoning`: show effort; `/reasoning EFFORT`: change effort until exit.
+    Invalid values or extra arguments leave it unchanged; changes are not saved
+    as configuration or session settings.
+  - `!COMMAND`: run directly in the workspace using the shell tool's permission
+    checks, 60-second timeout, decoding, and output bounds. Print stdout/stderr
+    and `ok` or an error cause/exit code with elapsed milliseconds. Interruption
+    returns to the prompt without retrying. Shells are separate; `cd` does not
+    persist. Do not call the model, save command/output, or show a token summary.
   - `/help`: concise help.
   - `/quit` and `/exit`: exit.
 - Compaction retains the system prompt, workspace instructions, and tool
@@ -184,8 +200,9 @@ These are reviewable steps, not separate subsystems or a large PR program.
    and remaining failure-path tests. Optional live smoke tests with an explicitly
    selected provider/model; no paid calls in the default test run.
    Done: launcher, `requirements.txt`, README, `test_sdk_wire.py`, and
-   `test_live.py` (opt-in); `pieni.py` is ~1,340 lines after deduplication and the
-   standalone prompt option, above the ~750 guideline. File-tool validation and
+   `test_live.py` (opt-in); `pieni.py` has about 1500 lines of code after
+   deduplication, the standalone prompt option, reasoning controls, and shell shortcuts, above the
+   ~750 guideline. File-tool validation and
    permission checks share one path;
    Chat Completions and OpenRouter share request/reply handling.
    Streaming defaults, layered configuration, and failure-path tests are also
@@ -195,6 +212,9 @@ These are reviewable steps, not separate subsystems or a large PR program.
    Also added `scripts/install.sh` (Ubuntu installer, tested by `test_install.py`)
    with the launcher following symlinks so an installed command still finds its
    own files; that is packaging, not agent scope.
+   Reasoning controls and terminal-only `!COMMAND` shortcuts are implemented
+   (`test_controls.py`), including provider reasoning replay and offline SDK
+   payload checks. Hosted reasoning behavior remains unverified.
 
 Mock each provider's SDK call, including OpenRouter client cleanup, tool-call
 continuation, usage extraction, and missing-key/provider errors. No live API
@@ -221,7 +241,7 @@ Keep the suite comprehensive for this scope, not a separate testing framework.
 - Live streaming of reasoning as it arrives (the thinking trace is shown after the
   reply completes, not token by token), exact tokenizer-based accounting,
   model-specific context-window discovery, and automatic compaction.
-- Runtime provider/model switching and reasoning-effort controls.
+- Runtime provider/model switching.
 - Web search, including provider-native search or a Tavily fallback.
 - MCP, skills, plugins, multiple agent modes, and a true OS sandbox.
 

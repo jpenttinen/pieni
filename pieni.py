@@ -1063,7 +1063,7 @@ CREATE TABLE IF NOT EXISTS messages (
 
 
 def private_database_file(path, create=False):
-    """Tighten only a regular, unlinked database file, without following symlinks."""
+    """Make a regular file with one link private, without following symlinks."""
     if path.is_symlink():
         raise OSError("conversation database and sidecars must not be symbolic links")
     flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
@@ -1184,6 +1184,15 @@ def compact_text(text):
             f"{text[-half:]}")
 
 
+def compact_arguments(raw):
+    """Shorten argument text while retaining full paths and non-string values."""
+    try:
+        return {key: compact_text(value) if key != "path" and isinstance(value, str) else value
+                for key, value in parse_tool_arguments(raw).items()}
+    except PieniError:
+        return compact_text(str(raw))
+
+
 def compaction_history(messages):
     """Serialize a shortened copy as data, never as native tool calls."""
     history = []
@@ -1193,17 +1202,8 @@ def compaction_history(messages):
         if message["role"] == "tool":
             entry["content"] = compact_text(message.get("content", ""))
         if message.get("tool_calls"):
-            calls = []
-            for call in message["tool_calls"]:
-                try:
-                    arguments = {
-                        key: compact_text(value) if key != "path" and isinstance(value, str) else value
-                        for key, value in parse_tool_arguments(call["arguments"]).items()
-                    }
-                except PieniError:
-                    arguments = compact_text(str(call["arguments"]))
-                calls.append({**call, "arguments": arguments})
-            entry["tool_calls"] = calls
+            entry["tool_calls"] = [{**call, "arguments": compact_arguments(call["arguments"])}
+                                   for call in message["tool_calls"]]
         history.append(entry)
     return json.dumps(history, ensure_ascii=False)
 

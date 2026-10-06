@@ -1282,9 +1282,8 @@ class Agent:
         usage = TaskUsage()
         started = time.monotonic()
         self.remember({"role": "user", "content": prompt})
-        finished = False
         try:
-            finished = self.steps(usage)
+            return self.steps(usage)
         except ProviderError as exc:
             self.out(f"error: {exc}")
         except KeyboardInterrupt:
@@ -1292,7 +1291,7 @@ class Agent:
         finally:
             usage.elapsed_seconds = time.monotonic() - started
             self.out(usage.line(self.context_tokens()))
-        return finished
+        return False
 
     def steps(self, usage):
         """Model and tool rounds until the model answers without tool calls."""
@@ -1398,14 +1397,12 @@ class Agent:
         self.out(f"reasoning: {getattr(self.provider, 'reasoning', 'default')}")
 
     def set_permissions(self, argument):
-        if not argument:
-            self.out(f"permissions: {self.permissions.mode}")
-            return
-        if argument not in PERMISSIONS:
-            self.out(f"permissions must be {' or '.join(PERMISSIONS)}")
-            return
-        self.permissions.mode = argument
-        self.out(f"permissions: {argument}")
+        if argument:
+            if argument not in PERMISSIONS:
+                self.out(f"permissions must be {' or '.join(PERMISSIONS)}")
+                return
+            self.permissions.mode = argument
+        self.out(f"permissions: {self.permissions.mode}")
         if argument == "yolo":
             self.out(YOLO_WARNING)
 
@@ -1538,33 +1535,33 @@ def run_agent(arguments):
     workspace = Path.cwd()
     provider = build_provider(provider_name, settings["model"] or "",
                               streaming=settings["streaming"], reasoning=settings["reasoning"])
-    if arguments.prompt is not None:
-        with contextlib.closing(provider):
+    with contextlib.closing(provider):
+        if arguments.prompt is not None:
             return run_prompt(provider, arguments.prompt)
-    with contextlib.closing(provider), contextlib.closing(Store(workspace / DB_PATH)) as store:
-        session_id, messages = store.resume(provider.name, provider.model, str(workspace))
-        if session_id is None:
-            session_id = store.start_session(provider.name, provider.model, str(workspace))
-            session_line = f"new session with {provider.name}/{provider.model}"
-        else:
-            session_line = (f"resumed a session with {len(messages)} message(s) "
-                            f"({provider.name}/{provider.model})")
-        if arguments.run is None:
-            print(BANNER)  # greet an interactive session, once the start has worked
-        print(session_line)
-        permissions = Permissions(
-            settings["permissions"], workspace,
-            approve=None if arguments.run is not None else cli_approve)
-        print(f"permissions: {permissions.mode}")
-        if permissions.mode == "yolo":
-            print(YOLO_WARNING)
-        agent = Agent(provider, store, session_id, build_instructions(workspace),
-                      messages, workspace, permissions)
-        if arguments.run is not None:
+        interactive = arguments.run is None
+        with contextlib.closing(Store(workspace / DB_PATH)) as store:
+            session_id, messages = store.resume(provider.name, provider.model, str(workspace))
+            if session_id is None:
+                session_id = store.start_session(provider.name, provider.model, str(workspace))
+                session_line = f"new session with {provider.name}/{provider.model}"
+            else:
+                session_line = (f"resumed a session with {len(messages)} message(s) "
+                                f"({provider.name}/{provider.model})")
+            if interactive:
+                print(BANNER)  # greet an interactive session, once the start has worked
+            print(session_line)
+            permissions = Permissions(settings["permissions"], workspace,
+                                      approve=cli_approve if interactive else None)
+            print(f"permissions: {permissions.mode}")
+            if permissions.mode == "yolo":
+                print(YOLO_WARNING)
+            agent = Agent(provider, store, session_id, build_instructions(workspace),
+                          messages, workspace, permissions)
+            if interactive:
+                return run_interactive(agent)
             if not arguments.run.strip():
                 raise ConfigError("-r/--run needs a non-empty prompt")
             return 0 if agent.run_task(arguments.run) else 1
-        return run_interactive(agent)
 
 
 def main(argv=None):
@@ -1577,12 +1574,9 @@ def main(argv=None):
         return 0
     try:
         return run_agent(parse_args(arguments))
-    except ConfigError as exc:
-        print(f"pieni: {exc}", file=sys.stderr)
-        return 2
     except PieniError as exc:
         print(f"pieni: {exc}", file=sys.stderr)
-        return 1
+        return 2 if isinstance(exc, ConfigError) else 1
 
 
 if __name__ == "__main__":

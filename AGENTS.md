@@ -8,7 +8,8 @@ working example over a complete product. Follow the scope and milestones in
 
 ## Keep it small
 
-- Keep all agent implementation in `pieni.py`, with a Bash launcher named `pieni`.
+- Keep all agent implementation in `pieni.py`, with a Bash launcher named `pieni.sh`.
+  The installer exposes it as the `pieni` command.
   The launcher runs `.venv/bin/python` when it exists, else `python3`, and follows
   symlinks so an installed command still finds its own files.
 - Use the Python standard library and only two direct external dependencies:

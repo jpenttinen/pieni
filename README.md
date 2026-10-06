@@ -3,7 +3,7 @@
 **v0.15** — written by Petri Kuittinen, 2026.
 
 A tiny AI coding agent written in Python: one file of about 1500 lines of code
-(`pieni.py`) plus a small Bash launcher (`pieni`). It is meant for learning how
+(`pieni.py`) plus a small Bash launcher (`pieni.sh`). It is meant for learning how
 agents work — read it, run it, fork it, change it. Despite its small size, pieni
 has a best-effort destructive command guard (DCG). It supports hundreds
 of models and can be extended. It can even generate you games or run web browser.
@@ -39,13 +39,13 @@ PATH as a symlink to this checkout. It needs no sudo.
 
 What it does, step by step:
 
-1. Checks that `pieni`, `pieni.py`, and `requirements.txt` are in this checkout,
+1. Checks that `pieni.sh`, `pieni.py`, and `requirements.txt` are in this checkout,
    and that the launcher is executable and free of shell syntax errors.
 2. Checks `python3` (3.8 or newer).
 3. Checks whether `openai` and `openrouter` are importable in the interpreter the
    launcher selects. If not, it creates or repairs `.venv` in this checkout and
    runs `pip install -r requirements.txt` there.
-4. Symlinks `~/.local/bin/pieni` to this checkout's launcher and runs
+4. Symlinks `~/.local/bin/pieni` to this checkout's `pieni.sh` and runs
    `pieni --help` to prove the installed command works.
 5. Warns if `~/.local/bin` is not on your PATH, and prints how to uninstall.
 
@@ -68,12 +68,12 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-On Windows use `.venv\Scripts\pip` instead of `.venv/bin/pip`. The `./pieni`
+On Windows use `.venv\Scripts\pip` instead of `.venv/bin/pip`. The `./pieni.sh`
 launcher uses `.venv/bin/python` automatically when that file exists, so you do
 not have to activate the environment:
 
 ```console
-./pieni openai -m "gpt-6-luna"
+./pieni.sh openai -m "gpt-6-luna"
 ```
 
 ## Configuration
@@ -120,17 +120,19 @@ without retrying with another setting.
 
 ## CLI usage
 
+Run `./pieni.sh` from the checkout, or use `pieni` after installing the command.
+
 ```console
-./pieni                                       # no arguments: banner and help, then exit
-./pieni openai -m "gpt-6-luna"                # interactive session
-./pieni deepseek -m "deepseek-chat"
-./pieni openrouter -m "vendor/model"
-./pieni http://localhost:30000 -m "qwen3-30b" # local server
-./pieni openai -m "gpt-6-luna" --permissions yolo
-./pieni openai -m "MODEL" --no-streaming       # wait for a complete reply
-./pieni openai -m "MODEL" --reasoning high     # set reasoning effort
-./pieni deepseek -m "MODEL" --streaming       # override streaming = false
-./pieni openai -m "gpt-6-luna" -p "What is the capital of Finland?"
+./pieni.sh                                       # no arguments: banner and help, then exit
+./pieni.sh openai -m "gpt-6-luna"                # interactive session
+./pieni.sh deepseek -m "deepseek-chat"
+./pieni.sh openrouter -m "vendor/model"
+./pieni.sh http://localhost:30000 -m "qwen3-30b" # local server
+./pieni.sh openai -m "gpt-6-luna" --permissions yolo
+./pieni.sh openai -m "MODEL" --no-streaming       # wait for a complete reply
+./pieni.sh openai -m "MODEL" --reasoning high     # set reasoning effort
+./pieni.sh deepseek -m "MODEL" --streaming       # override streaming = false
+./pieni.sh openai -m "gpt-6-luna" -p "What is the capital of Finland?"
 ```
 
 Started with no arguments, Pieni prints its banner, usage, and command list, then
@@ -147,7 +149,7 @@ streaming setting and its CLI overrides apply. `-p` and `-r` are mutually exclus
 An interactive session greets you with the version banner and the startup state:
 
 ```console
-./pieni deepseek -m "deepseek-chat"
+./pieni.sh deepseek -m "deepseek-chat"
 Pieni agent v0.15 by Petri Kuittinen
 resumed a session with 6 message(s) (deepseek/deepseek-chat)
 permissions: auto
@@ -160,7 +162,7 @@ Headless runs (`-r`) print no banner, so their output stays script-friendly.
 ## Headless mode
 
 ```console
-./pieni openai -m "gpt-6-luna" -r "Explain this repository in five bullets."
+./pieni.sh openai -m "gpt-6-luna" -r "Explain this repository in five bullets."
 ```
 
 `-r/--run` runs one task, prints the answer and the task summary, and exits. The
@@ -170,10 +172,10 @@ approval are denied instead of waiting for input.
 Headless mode is the path verified in v0.13 across all providers:
 
 ```console
-./pieni openai -m "gpt-6-luna" -r "Summarize README.md."
-./pieni deepseek -m "deepseek-chat" -r "Summarize README.md."
-./pieni openrouter -m "vendor/model" -r "Summarize README.md."
-./pieni http://localhost:30000 -m "qwen3-30b" -r "Summarize README.md."
+./pieni.sh openai -m "gpt-6-luna" -r "Summarize README.md."
+./pieni.sh deepseek -m "deepseek-chat" -r "Summarize README.md."
+./pieni.sh openrouter -m "vendor/model" -r "Summarize README.md."
+./pieni.sh http://localhost:30000 -m "qwen3-30b" -r "Summarize README.md."
 ```
 
 Model names are examples only; use whatever your provider or local server offers.

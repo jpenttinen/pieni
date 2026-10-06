@@ -14,8 +14,10 @@ what to do next — instead of answering in one shot. Those steps are the same i
 agents, so understanding them here should also help you use those agents more
 deliberately.
 
-Pieni is just [one Python file](../pieni.py), with about 1500 lines of code.
-This guide follows its actual implementation.
+Pieni is just [one Python file](../pieni.py), with about 1500 lines of code,
+plus the [Bash launcher](../pieni.sh). Run `./pieni.sh` from the checkout; the
+installer exposes the same launcher as the `pieni` command. This guide follows
+its actual implementation.
 
 ## Contents
 

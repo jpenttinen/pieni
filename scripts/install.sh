@@ -4,7 +4,7 @@
 #
 # It checks the launcher in this checkout, makes sure the Python dependencies
 # (openai, openrouter) are importable, and puts a `pieni` command into
-# ~/.local/bin as a symlink to this checkout's launcher. No sudo is needed.
+# ~/.local/bin as a symlink to this checkout's pieni.sh launcher. No sudo is needed.
 #
 #   scripts/install.sh                  install into ~/.local/bin
 #   scripts/install.sh --prefix /usr/local
@@ -81,7 +81,7 @@ case "$prefix" in
 esac
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
-for file in pieni pieni.py requirements.txt; do
+for file in pieni.sh pieni.py requirements.txt; do
     [ -e "$repo/$file" ] || die "$repo/$file is missing: run this script from a pieni checkout"
 done
 say "checkout: $repo"
@@ -106,7 +106,7 @@ say "python:   $("$python" -c 'import sys; print(sys.version.split()[0])') ($(co
 
 # --- The launcher must be usable before we link to it ----------------------
 
-launcher="$repo/pieni"
+launcher="$repo/pieni.sh"
 [ -f "$launcher" ] || die "$launcher is not a regular file"
 head -n 1 "$launcher" | grep -q '^#!' || die "$launcher has no shebang line"
 bash -n "$launcher" || die "$launcher has a shell syntax error"
@@ -164,6 +164,11 @@ bin_dir="$prefix/bin"
 dest="$bin_dir/pieni"
 if [ -L "$dest" ] && [ "$(readlink -f "$dest")" = "$launcher" ]; then
     say "command:  $dest already points here"
+elif [ -L "$dest" ] && [ ! -e "$repo/pieni" ] \
+        && [ "$(readlink -f "$dest")" = "$repo/pieni" ]; then
+    # Repair this checkout's installed command after the launcher was renamed.
+    do_it ln -sfn "$launcher" "$dest" || die "cannot update the symlink $dest"
+    say "command:  $dest -> $launcher"
 elif [ -e "$dest" ] || [ -L "$dest" ]; then
     die "$dest already exists and is not this checkout's launcher: move it away and retry"
 else

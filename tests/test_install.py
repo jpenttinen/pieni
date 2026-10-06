@@ -92,11 +92,11 @@ class InstallScriptTests(unittest.TestCase):
     def copy_checkout(self):
         """A throwaway copy of the files the installer needs."""
         (self.repo / "scripts").mkdir(parents=True)
-        for name in ("pieni", "pieni.py", "requirements.txt"):
+        for name in ("pieni.sh", "pieni.py", "requirements.txt"):
             shutil.copy2(REPO / name, self.repo / name)
         shutil.copy2(INSTALLER, self.repo / "scripts" / "install.sh")
         (self.repo / "scripts" / "install.sh").chmod(0o755)
-        (self.repo / "pieni").chmod(0o755)
+        (self.repo / "pieni.sh").chmod(0o755)
 
     def install(self, *arguments, environment=None, path=None, cwd=None):
         env = dict(os.environ)
@@ -159,14 +159,14 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("is missing", completed.stderr)
 
     def test_syntax_error_in_the_launcher_is_reported(self):
-        (self.repo / "pieni").write_text("#!/usr/bin/env bash\nif then\n", encoding="utf-8")
+        (self.repo / "pieni.sh").write_text("#!/usr/bin/env bash\nif then\n", encoding="utf-8")
         completed = self.install("--skip-deps")
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("syntax error", completed.stderr)
         self.assertFalse((self.prefix / "bin" / "pieni").exists())
 
     def test_launcher_without_a_shebang_is_reported(self):
-        launcher = self.repo / "pieni"
+        launcher = self.repo / "pieni.sh"
         launcher.write_text("exec python3 pieni.py\n", encoding="utf-8")
         launcher.chmod(0o755)
         completed = self.install("--skip-deps")
@@ -190,7 +190,7 @@ class InstallScriptTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         dest = self.prefix / "bin" / "pieni"
         self.assertTrue(dest.is_symlink(), completed.stdout)
-        self.assertEqual(dest.resolve(), (self.repo / "pieni").resolve())
+        self.assertEqual(dest.resolve(), (self.repo / "pieni.sh").resolve())
         self.assertTrue(os.access(dest, os.X_OK))
         self.assertIn("--skip-deps", completed.stderr)  # says deps were not checked
         self.assertIn("dependencies: not checked", completed.stdout)
@@ -222,6 +222,41 @@ class InstallScriptTests(unittest.TestCase):
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertIn("already points here", again.stdout)
 
+    def test_reinstall_repairs_this_checkouts_renamed_launcher_symlink(self):
+        (self.prefix / "bin").mkdir(parents=True)
+        dest = self.prefix / "bin" / "pieni"
+        dest.symlink_to(self.repo / "pieni")  # the source name before the rename
+
+        completed = self.install("--skip-deps")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(dest.resolve(), (self.repo / "pieni.sh").resolve())
+        self.assertIn("--help responds", completed.stdout)
+
+    def test_dry_run_leaves_legacy_launcher_symlink_unchanged(self):
+        (self.prefix / "bin").mkdir(parents=True)
+        dest = self.prefix / "bin" / "pieni"
+        legacy = self.repo / "pieni"
+        dest.symlink_to(legacy)
+
+        completed = self.install("--dry-run", "--skip-deps")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("[dry-run] ln -sfn", completed.stdout)
+        self.assertEqual(os.readlink(dest), str(legacy))
+
+    def test_existing_foreign_broken_symlink_is_not_overwritten(self):
+        (self.prefix / "bin").mkdir(parents=True)
+        dest = self.prefix / "bin" / "pieni"
+        foreign = self.root / "other-checkout" / "pieni"
+        dest.symlink_to(foreign)
+
+        completed = self.install("--skip-deps")
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("already exists", completed.stderr)
+        self.assertEqual(os.readlink(dest), str(foreign))
+
     def test_existing_foreign_file_is_not_overwritten(self):
         (self.prefix / "bin").mkdir(parents=True)
         other = self.prefix / "bin" / "pieni"
@@ -233,7 +268,7 @@ class InstallScriptTests(unittest.TestCase):
                          "#!/bin/sh\necho someone else's pieni\n")
 
     def test_missing_executable_bit_is_added(self):
-        launcher = self.repo / "pieni"
+        launcher = self.repo / "pieni.sh"
         launcher.chmod(0o644)
         self.assertFalse(os.access(launcher, os.X_OK))
         completed = self.install("--skip-deps")

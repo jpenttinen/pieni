@@ -2054,7 +2054,7 @@ class PromptCliTests(TempWorkspaceCase):
 
 
 class LauncherTests(unittest.TestCase):
-    """The Bash launcher runs pieni.py, preferring the project virtualenv."""
+    """The pieni.sh launcher runs pieni.py, preferring the project virtualenv."""
 
     def setUp(self):
         if not Path("/usr/bin/env").exists():
@@ -2063,10 +2063,9 @@ class LauncherTests(unittest.TestCase):
         self.addCleanup(self.tempdir.cleanup)
         self.root = Path(self.tempdir.name)
         self.marker = self.root / "marker.txt"
-        source = Path(pieni.__file__).with_name("pieni")
-        if not source.exists():
-            self.skipTest("the launcher is not next to pieni.py")
-        self.launcher = self.root / "pieni"
+        source = Path(pieni.__file__).with_name("pieni.sh")
+        self.assertTrue(source.is_file(), "pieni.sh must be next to pieni.py")
+        self.launcher = self.root / "pieni.sh"
         self.launcher.write_bytes(source.read_bytes())
         self.launcher.chmod(0o755)
         # A stub agent records its arguments, so the test stays unaware of the CLI.

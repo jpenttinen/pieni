@@ -10,7 +10,8 @@ production agent platform.
 All agent code belongs in `pieni.py`, aiming for about 750 readable lines.
 Use only the standard library and two direct external dependencies, `openai` and
 `openrouter`, listed in `requirements.txt` (`pip install -r requirements.txt`).
-Provide a small Bash launcher named `pieni`; tests live in separate Python files. No agent code is to be generated during this planning task.
+Provide a small Bash launcher named `pieni.sh`, installed as the `pieni` command;
+tests live in separate Python files. No agent code is to be generated during this planning task.
 
 ## First version
 
@@ -109,7 +110,8 @@ Provide a small Bash launcher named `pieni`; tests live in separate Python files
   Custom endpoints use `PIENI_CUSTOM_API_KEY` if needed; never forward the OpenAI
   provider's key to them. Do not require a key for a
   local endpoint that accepts unauthenticated requests.
-- Run as `pieni PROVIDER -m MODEL` or `python3 pieni.py PROVIDER -m MODEL`.
+- Run as `./pieni.sh PROVIDER -m MODEL` from the checkout, `pieni PROVIDER -m MODEL`
+  after installation, or `python3 pieni.py PROVIDER -m MODEL`.
   Provider and `-m` may be omitted when supplied by configuration.
 - `-r/--run "prompt"` runs one headless task. `--permissions auto|yolo` selects
   permissions for either interface; default is `auto`.

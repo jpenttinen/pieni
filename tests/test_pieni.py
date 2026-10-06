@@ -537,7 +537,29 @@ class BuildProviderTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"openai": None}):
             with self.assertRaises(pieni.ConfigError) as caught:
                 pieni.build_provider("openai", "m", {"OPENAI_API_KEY": "k"})
-        self.assertIn("pip install -r requirements.txt", str(caught.exception))
+        self.assertIn("pip install --upgrade -r", str(caught.exception))
+        self.assertIn(str(Path(pieni.__file__).with_name("requirements.txt")), str(caught.exception))
+        self.assertIn(sys.executable, str(caught.exception))
+
+    def test_importable_sdk_without_its_client_reports_origin_and_repair(self):
+        for name, attribute, environment in (
+                ("openai", "OpenAI", {"OPENAI_API_KEY": "k"}),
+                ("openrouter", "OpenRouter", {"OPENROUTER_API_KEY": "k"})):
+            for client in (None, "not a client"):
+                with self.subTest(sdk=name, client=client):
+                    module = SimpleNamespace(__file__=f"/old-sdk/{name}/__init__.py")
+                    if client is not None:
+                        setattr(module, attribute, client)
+                    with mock.patch.dict(sys.modules, {name: module}):
+                        with self.assertRaises(pieni.ConfigError) as caught:
+                            pieni.build_provider(name, "m", environment)
+                    error = str(caught.exception)
+                    self.assertIn(f"does not provide {attribute}", error)
+                    self.assertIn(module.__file__, error)
+                    self.assertIn(sys.executable, error)
+                    self.assertIn("pip install --upgrade -r", error)
+                    self.assertIn(str(Path(pieni.__file__).with_name("requirements.txt")), error)
+                    self.assertIn(f"local {name}.py or {name}/", error)
 
     def test_client_construction_failure_is_wrapped(self):
         broken = mock.Mock(side_effect=ValueError("bad base url"))

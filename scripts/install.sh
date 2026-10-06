@@ -122,6 +122,8 @@ fi
 dependencies="not checked (--skip-deps)"
 if [ "$skip_deps" -eq 0 ]; then
     venv="$repo/.venv"
+    sdk_check='import openai, openrouter, sys
+sys.exit(0 if callable(getattr(openai, "OpenAI", None)) and callable(getattr(openrouter, "OpenRouter", None)) else 1)'
     # Match the launcher: an existing virtualenv takes precedence over python3.
     # PYTHON selects the interpreter for creating a venv, not the fallback launcher.
     if [ -x "$venv/bin/python" ]; then
@@ -129,11 +131,11 @@ if [ "$skip_deps" -eq 0 ]; then
     else
         deps_python="$(command -v python3 2>/dev/null || true)"
     fi
-    if [ -n "$deps_python" ] && "$deps_python" -c 'import openai, openrouter' >/dev/null 2>&1; then
+    if [ -n "$deps_python" ] && "$deps_python" -c "$sdk_check" >/dev/null 2>&1; then
         dependencies="already available with $deps_python"
         say "deps:     $dependencies"
     else
-        say "deps:     missing; installing openai and openrouter into $venv"
+        say "deps:     missing or incompatible; installing openai and openrouter into $venv"
         if [ ! -x "$venv/bin/python" ]; then
             do_it "$python" -m venv "$venv" \
                 || die "cannot create $venv: sudo apt install python3-venv"
@@ -143,13 +145,13 @@ if [ "$skip_deps" -eq 0 ]; then
             fi
         fi
         if [ "$dry_run" -eq 1 ]; then
-            printf '  [dry-run] %s -m pip install --requirement %s\n' \
+            printf '  [dry-run] %s -m pip install --upgrade --requirement %s\n' \
                 "$venv/bin/python" "$repo/requirements.txt"
         else
-            "$venv/bin/python" -m pip install --requirement "$repo/requirements.txt" \
+            "$venv/bin/python" -m pip install --upgrade --requirement "$repo/requirements.txt" \
                 || die "pip install failed: check your network connection and try again"
-            "$venv/bin/python" -c 'import openai, openrouter' >/dev/null 2>&1 \
-                || die "dependencies are still missing: $venv/bin/pip install -r $repo/requirements.txt"
+            "$venv/bin/python" -c "$sdk_check" >/dev/null 2>&1 \
+                || die "dependencies are still missing or incompatible: $venv/bin/python -m pip install --upgrade -r $repo/requirements.txt"
             dependencies="installed into $venv"
             say "deps:     $dependencies"
         fi

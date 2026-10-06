@@ -42,9 +42,9 @@ What it does, step by step:
 1. Checks that `pieni.sh`, `pieni.py`, and `requirements.txt` are in this checkout,
    and that the launcher is executable and free of shell syntax errors.
 2. Checks `python3` (3.8 or newer).
-3. Checks whether `openai` and `openrouter` are importable in the interpreter the
-   launcher selects. If not, it creates or repairs `.venv` in this checkout and
-   runs `pip install -r requirements.txt` there.
+3. Checks for `openai.OpenAI` and `openrouter.OpenRouter` in the interpreter the
+   launcher selects. If either is missing, it creates or repairs `.venv` in this
+   checkout and runs `pip install --upgrade -r requirements.txt` there.
 4. Symlinks `~/.local/bin/pieni` to this checkout's `pieni.sh` and runs
    `pieni --help` to prove the installed command works.
 5. Warns if `~/.local/bin` is not on your PATH, and prints how to uninstall.
@@ -65,11 +65,11 @@ library):
 
 ```console
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+.venv/bin/python -m pip install --upgrade -r requirements.txt
 ```
 
-On Windows use `.venv\Scripts\pip` instead of `.venv/bin/pip`. The `./pieni.sh`
-launcher uses `.venv/bin/python` automatically when that file exists, so you do
+On Windows use `.venv\Scripts\python -m pip` instead of `.venv/bin/python -m pip`.
+The `./pieni.sh` launcher uses `.venv/bin/python` automatically when that file exists, so you do
 not have to activate the environment:
 
 ```console
@@ -364,7 +364,7 @@ alongside the installer tests:
 python3 -m unittest discover  # includes installer tests against temporary copies
 ```
 
-`test_install.py` (22 tests) copies the checkout into a temporary directory, runs
+`test_install.py` copies the checkout into a temporary directory, runs
 `scripts/install.sh` there with a temporary prefix, and never touches your home
 directory or the network; a stub interpreter stands in for python3 when the
 dependency path has to be exercised.

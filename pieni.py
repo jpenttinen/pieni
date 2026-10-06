@@ -15,6 +15,7 @@ import importlib
 import json
 import os
 import re
+import shlex
 import signal
 import sqlite3
 import stat
@@ -960,12 +961,19 @@ def call_responses(client, model, messages, tools, streaming=DEFAULT_STREAMING,
 
 
 def load_sdk(module_name, attribute_name):
+    requirements = shlex.quote(str(Path(__file__).resolve().with_name("requirements.txt")))
+    repair = f"{shlex.quote(sys.executable)} -m pip install --upgrade -r {requirements}"
     try:
         module = importlib.import_module(module_name)
     except ImportError as exc:
-        raise ConfigError(f"missing dependency '{module_name}': "
-                          f"run pip install -r requirements.txt") from exc
-    return getattr(module, attribute_name)
+        raise ConfigError(f"missing dependency '{module_name}': run {repair}") from exc
+    client = getattr(module, attribute_name, None)
+    if not callable(client):
+        origin = getattr(module, "__file__", None) or "an unknown location"
+        raise ConfigError(f"'{module_name}' loaded from {origin} does not provide {attribute_name}; "
+                          f"run {repair}. Check for a local {module_name}.py or {module_name}/ "
+                          "that shadows the SDK")
+    return client
 
 
 class Provider:

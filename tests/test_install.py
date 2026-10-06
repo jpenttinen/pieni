@@ -29,6 +29,7 @@ class FakePython:
 case "$*" in
     *sys.version.split*) printf '3.12.9\\n' ;;
     *"import openai, openrouter"*) exit 0 ;;
+    *pieni.py*--help*) printf 'usage: pieni\\n' ;;
 esac
 exit 0
 """
@@ -56,6 +57,21 @@ esac
 exit 0
 INNER
         chmod +x "$3/bin/python"
+        ;;
+esac
+exit 0
+"""
+
+    # SDKs become importable only after the installer's simulated pip call.
+    REPAIRABLE_VENV = """#!/usr/bin/env bash
+marker="${0%/*}/sdk-ready"
+case "$*" in
+    *"import openai, openrouter"*) [ -f "$marker" ]; exit $? ;;
+    "-m pip install "*) printf '%s\\n' "$*" >> "$marker" ;;
+    *pieni.py*--help*) printf 'usage: pieni\\n' ;;
+    *pieni.py*)
+        [ -f "$marker" ] || exit 1
+        printf 'SDKs available\\n'
         ;;
 esac
 exit 0
@@ -103,6 +119,13 @@ class InstallScriptTests(unittest.TestCase):
         stub.write_text(body, encoding="utf-8")
         stub.chmod(0o755)
         return bin_dir, stub
+
+    def stub_venv(self, body):
+        stub = self.repo / ".venv" / "bin" / "python"
+        stub.parent.mkdir(parents=True)
+        stub.write_text(body, encoding="utf-8")
+        stub.chmod(0o755)
+        return stub
 
     # -- the script itself ---------------------------------------------------
 
@@ -234,7 +257,7 @@ class InstallScriptTests(unittest.TestCase):
     # -- dependencies --------------------------------------------------------
 
     def test_present_dependencies_are_detected_and_pip_is_not_used(self):
-        bin_dir, stub = self.stub_python(FakePython.PRESENT)
+        bin_dir, stub = self.stub_python(FakePython.PRESENT, "python3")
         completed = self.install(environment={"PYTHON": str(stub)}, path=bin_dir)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn(f"deps:     already available with {stub}", completed.stdout)
@@ -242,8 +265,47 @@ class InstallScriptTests(unittest.TestCase):
         self.assertFalse((self.repo / ".venv").exists())
         self.assertIn(f"dependencies: already available with {stub}", completed.stdout)
 
+    def test_existing_venv_is_repaired_even_when_system_sdks_are_present(self):
+        bin_dir, _ = self.stub_python(FakePython.PRESENT, "python3")
+        venv_python = self.stub_venv(FakePython.REPAIRABLE_VENV)
+        marker = venv_python.with_name("sdk-ready")
+
+        completed = self.install(path=bin_dir)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(f"dependencies: installed into {self.repo / '.venv'}", completed.stdout)
+        self.assertEqual(marker.read_text(encoding="utf-8"),
+                         f"-m pip install --requirement {self.repo / 'requirements.txt'}\n")
+        # The installed launcher now uses the repaired venv, not the system stub.
+        run = subprocess.run([str(self.prefix / "bin" / "pieni"), "openai", "-m", "m", "-p", "hello"],
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout, "SDKs available\n")
+
+    def test_dry_run_describes_venv_repair_without_using_system_sdks(self):
+        bin_dir, _ = self.stub_python(FakePython.PRESENT, "python3")
+        venv_python = self.stub_venv(FakePython.REPAIRABLE_VENV)
+
+        completed = self.install("--dry-run", path=bin_dir)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(f"[dry-run] {venv_python} -m pip install", completed.stdout)
+        self.assertFalse(venv_python.with_name("sdk-ready").exists())
+        self.assertFalse(self.prefix.exists())
+
+    def test_custom_python_sdks_do_not_mask_missing_launcher_sdks(self):
+        bin_dir, _ = self.stub_python(FakePython.BROKEN, "python3")
+        _, custom_python = self.stub_python(FakePython.PRESENT)
+
+        completed = self.install("--dry-run", environment={"PYTHON": str(custom_python)}, path=bin_dir)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("missing; installing openai and openrouter", completed.stdout)
+        self.assertIn(f"[dry-run] {custom_python} -m venv {self.repo / '.venv'}", completed.stdout)
+        self.assertFalse((self.repo / ".venv").exists())
+
     def test_dependencies_that_stay_missing_are_reported(self):
-        bin_dir, stub = self.stub_python(FakePython.MAKES_VENV)
+        bin_dir, stub = self.stub_python(FakePython.MAKES_VENV, "python3")
         completed = self.install(environment={"PYTHON": str(stub)}, path=bin_dir)
         self.assertNotEqual(completed.returncode, 0, completed.stdout)
         self.assertIn("missing; installing openai and openrouter", completed.stdout)
@@ -251,7 +313,7 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("pip install -r", completed.stderr)
 
     def test_venv_that_produces_no_interpreter_is_reported(self):
-        bin_dir, stub = self.stub_python(FakePython.BROKEN)
+        bin_dir, stub = self.stub_python(FakePython.BROKEN, "python3")
         completed = self.install(environment={"PYTHON": str(stub)}, path=bin_dir)
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("cannot create", completed.stderr)
@@ -259,7 +321,7 @@ class InstallScriptTests(unittest.TestCase):
         self.assertFalse((self.repo / ".venv").exists())
 
     def test_dry_run_does_not_create_a_venv(self):
-        bin_dir, stub = self.stub_python(FakePython.BROKEN)
+        bin_dir, stub = self.stub_python(FakePython.BROKEN, "python3")
         completed = self.install("--dry-run", environment={"PYTHON": str(stub)}, path=bin_dir)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("[dry-run]", completed.stdout)

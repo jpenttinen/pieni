@@ -242,8 +242,10 @@ class ShellShortcutTests(fixtures.TempWorkspaceCase):
             with self.subTest(mode=mode, approved=approved):
                 approve = mock.Mock(return_value=approved)
                 agent, _, _, output = self.make_agent([], mode=mode, approve=approve)
-                with mock.patch("pieni.subprocess.run", return_value=SimpleNamespace(
-                        stdout="", stderr="", returncode=0)) as run:
+                process = mock.MagicMock(returncode=0)
+                process.__enter__.return_value = process
+                process.communicate.return_value = ("", "")
+                with mock.patch("pieni.subprocess.Popen", return_value=process) as run:
                     agent.run_shell("rm -rf build")
                 self.assertEqual(run.called, approved or mode == "yolo")
                 if mode == "yolo":
@@ -266,7 +268,12 @@ class ShellShortcutTests(fixtures.TempWorkspaceCase):
                                 (KeyboardInterrupt(), "interrupted")):
             with self.subTest(error=error):
                 agent, provider, store, output = self.make_agent([])
-                with mock.patch("pieni.subprocess.run", side_effect=error) as run:
+                process = mock.MagicMock()
+                process.__enter__.return_value = process
+                process.communicate.side_effect = error
+                spawn_error = error if isinstance(error, OSError) else None
+                with mock.patch("pieni.subprocess.Popen", return_value=process,
+                                side_effect=spawn_error) as run, mock.patch("pieni.os.killpg"):
                     with mock.patch("builtins.input", side_effect=["!sleep 999", "/quit"]):
                         with redirect_stdout(StringIO()):
                             self.assertEqual(pieni.run_interactive(agent), 0)

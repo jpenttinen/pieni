@@ -182,8 +182,10 @@ harness's attempt to narrow that gap, and it only reads the command text.
 Pieni also has practical limits: `read` returns at most 5,000 lines, tool handlers
 bound output to 65,536 characters, and shell commands default to a 60-second
 timeout, adjustable from 1 to 600 seconds. A timed-out command may have changed
-files before it stopped. These limits are not an OS-level resource or process-tree
-sandbox. The file tools are text tools, not byte-preserving binary editors;
+files before it stopped. On POSIX, timeout or interruption kills the shell's
+process group and reaps the shell; deliberately detached processes can survive.
+Other systems only kill the immediate process. These limits are not an OS-level
+resource or process-tree sandbox. The file tools are text tools, not byte-preserving binary editors;
 `read` removes line endings in its displayed output, and Python text I/O can
 normalize CRLF during an edit.
 
@@ -455,7 +457,7 @@ internal messages and tool definitions into an API request, then normalizes the
 reply into:
 
 ```python
-Reply(text, tool_calls, input_tokens, output_tokens, estimated, thinking, provider_reasoning)
+Reply(text, tool_calls, input_tokens, output_tokens, estimated, thinking, provider_reasoning, responses_output)
 ```
 
 `tool_calls` contains `ToolCall` objects. If the provider reports usage, Pieni uses
@@ -465,6 +467,13 @@ text, not a portable way to preserve a model's reasoning state. The optional
 OpenRouter reasoning fields and ordered blocks. Those fields are saved with
 assistant messages and replayed for tool continuation and resume; compaction
 omits them from its summary input.
+
+`responses_output` preserves the complete native OpenAI output sequence, including
+opaque reasoning items and message metadata. The next Responses request replays
+these items in order instead of reconstructing them from display text and tool
+calls. SQLite resume preserves this state; compaction omits the native replay
+payload while retaining visible text and tool evidence. Unsuccessful completion
+statuses are rejected in buffered replies as well as streams.
 
 `--reasoning EFFORT`, the INI `reasoning` key, and `/reasoning EFFORT` control
 effort on subsequent requests. `default` omits the effort parameter and lets
@@ -485,7 +494,7 @@ A wire format is the exact JSON shape an API expects.
 | `openai` | `openai`: `client.responses.create()` | System text becomes `instructions`; conversation becomes `input` items. Tools use a flat function definition. |
 | `deepseek` | `openai`: `client.chat.completions.create()` at `https://api.deepseek.com` | Chat messages and nested function schemas; key from `DEEPSEEK_API_KEY`. |
 | `openrouter` | `openrouter`: `client.chat.send()` | Shares Pieni's Chat Completions conversion and reply handling; key from `OPENROUTER_API_KEY`. |
-| An HTTP(S) URL | `openai`: Chat Completions at that base URL | Same conversion as DeepSeek; `OPENAI_API_KEY` if set, otherwise a placeholder for local servers. |
+| An HTTP(S) URL | `openai`: Chat Completions at that base URL | Same conversion as DeepSeek; `PIENI_CUSTOM_API_KEY` if set, otherwise a placeholder for local servers. |
 
 Here is the same tool result written in two of them:
 
@@ -538,11 +547,17 @@ The first checks ordinary replies. The second checks tool calling in addition.
 Use a disposable workspace for unfamiliar models or servers. Neither command
 proves the provider supports every tool, error path, or streaming variant.
 
-For a hosted compatible endpoint, set `OPENAI_API_KEY` in your environment and
+For a hosted compatible endpoint, set `PIENI_CUSTOM_API_KEY` in your environment and
 pass its documented base URL; append `/v1` only if the endpoint requires it.
 Pieni uses that key for custom URLs regardless of the vendor's usual variable
 name. Do not embed it in a URL, INI file, or tool command. The base URL chooses
 where SDK requests are sent, so use a server you trust.
+
+A launch-directory `pieni.ini` may use a custom provider URL already selected in
+your user settings. To select a different custom URL, pass it explicitly on the
+CLI or put it in `~/.pieni/pieni.ini`. A checkout cannot silently redirect an
+exported credential to a new custom server, and custom servers never receive
+`OPENAI_API_KEY` automatically.
 
 If you want a named shortcut such as `example`, the change is small but touches
 more than one dictionary:

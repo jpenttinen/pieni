@@ -64,6 +64,9 @@ Provide a small Bash launcher named `pieni`; tests live in separate Python files
 - Merge settings per key: local values override user values; omitted local keys
   retain user values. Explicit CLI arguments override both files; built-in
   defaults apply only when neither file nor CLI supplies a value.
+- A custom provider URL selected by local configuration must match the user's
+  provider URL or be explicitly selected on the CLI, so a checkout cannot redirect
+  exported credentials to a new recipient.
 - Keep one `[pieni]` section with `provider`, `model`, `permissions`, `streaming`, and `reasoning`
   settings. Provider/model may come from configuration instead of CLI arguments;
   report a clear error if either is still missing. Default permissions remain
@@ -103,7 +106,8 @@ Provide a small Bash launcher named `pieni`; tests live in separate Python files
   by the shared loop; do not build a general provider framework. Keep model names
   configurable rather than hard-coding sample model IDs.
 - Named providers use `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, or `DEEPSEEK_API_KEY`.
-  Custom endpoints use `OPENAI_API_KEY` if needed; do not require a key for a
+  Custom endpoints use `PIENI_CUSTOM_API_KEY` if needed; never forward the OpenAI
+  provider's key to them. Do not require a key for a
   local endpoint that accepts unauthenticated requests.
 - Run as `pieni PROVIDER -m MODEL` or `python3 pieni.py PROVIDER -m MODEL`.
   Provider and `-m` may be omitted when supplied by configuration.
@@ -156,8 +160,13 @@ Provide a small Bash launcher named `pieni`; tests live in separate Python files
 - Ctrl+C interrupts the current task and returns to the prompt; interruption at
   an idle prompt exits. Headless interruption exits nonzero. Completed actions
   are not rolled back.
+- On POSIX, terminate the shell process group on timeout or interruption and reap
+  the shell. Deliberately detached processes remain outside this cleanup.
 - Save prompts, replies, tool calls/results, and active context in standard-library
   SQLite at `.pieni/pieni.db` under the workspace. Do not save API keys.
+- Keep POSIX conversation directories private (`0700`) and databases private
+  (`0600`); reject symbolic links in app storage. Explicitly roll back failed
+  compaction commits before subsequent writes.
 - On startup, restore the latest session for the selected provider and model in
   that workspace, or start fresh if none exists. Report whether a session resumed.
 - Manual commands only:

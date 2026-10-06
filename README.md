@@ -21,7 +21,7 @@ Pieni supports these providers (set the API key as an environment variable):
 - OpenAI (`OPENAI_API_KEY`) — Responses API
 - DeepSeek (`DEEPSEEK_API_KEY`) — Chat Completions
 - OpenRouter (`OPENROUTER_API_KEY`) — openrouter SDK
-- Any custom base URL (`OPENAI_API_KEY` when the server needs one), including
+- Any custom base URL (`PIENI_CUSTOM_API_KEY` when the server needs one), including
   local servers such as llama.cpp / llama-server, ollama, LM Studio, vLLM —
   Chat Completions
 
@@ -42,8 +42,9 @@ What it does, step by step:
 1. Checks that `pieni`, `pieni.py`, and `requirements.txt` are in this checkout,
    and that the launcher is executable and free of shell syntax errors.
 2. Checks `python3` (3.8 or newer).
-3. Checks whether `openai` and `openrouter` are importable. If not, it creates
-   `.venv` in this checkout and runs `pip install -r requirements.txt` there.
+3. Checks whether `openai` and `openrouter` are importable in the interpreter the
+   launcher selects. If not, it creates or repairs `.venv` in this checkout and
+   runs `pip install -r requirements.txt` there.
 4. Symlinks `~/.local/bin/pieni` to this checkout's launcher and runs
    `pieni --help` to prove the installed command works.
 5. Warns if `~/.local/bin` is not on your PATH, and prints how to uninstall.
@@ -97,6 +98,11 @@ reasoning = default
 Missing files are fine. Malformed INI files, unknown settings, or invalid values
 are reported with a clear error. API keys belong in environment variables, never
 in these files.
+
+A custom provider URL from the launch-directory file must match the URL in your
+user settings, or be selected explicitly as the CLI provider. This prevents a
+checkout from redirecting your credentials to a new server. Custom servers use
+`PIENI_CUSTOM_API_KEY`; they never receive `OPENAI_API_KEY` automatically.
 
 Streaming defaults to `true` for every model and provider, including custom/local
 endpoints. Set `streaming = false` to wait for complete replies. Standard INI
@@ -292,7 +298,9 @@ Two honest limits on that trace:
 The short displayed trace is not saved as a separate message. DeepSeek's complete
 `reasoning_content` and OpenRouter's returned reasoning fields and blocks are
 saved with assistant messages and sent back for tool continuation and session
-resume. These fields can contain sensitive reasoning text, count toward context,
+resume. OpenAI's native Responses output items, including opaque reasoning and
+message metadata, are also preserved in order for continuation and resume.
+These replay fields can contain sensitive data, count toward context,
 and are omitted from the data sent for compaction. Old sessions without these
 fields still load; a provider may reject an older tool conversation that lacks
 required reasoning. Use `/compact` or `/compact all` to replace that context.
@@ -327,6 +335,9 @@ not a claim about the selected model.
 - The guard is best-effort pattern matching. It can miss destructive commands and
   flag harmless ones, and it is **not** a sandbox: `bash` runs with your user's
   filesystem and network access.
+- On POSIX systems, timeout or interruption kills the shell's process group and
+  waits for the shell to exit. Processes that deliberately detach can survive;
+  on other systems cleanup is limited to the immediate process.
 
 ## Saved data
 
@@ -335,6 +346,12 @@ are stored in SQLite at `.pieni/pieni.db` inside the workspace, and the latest
 session for the provider/model pair is resumed on startup. Treat that file as
 sensitive local data; API keys are never written to it.
 
+On POSIX systems Pieni creates `.pieni` with mode `0700` and its database with
+mode `0600`, and tightens existing storage to those modes on startup. Symbolic
+links for the storage directory, database, or SQLite sidecars are rejected.
+Databases and sidecars must be regular files with a single hard link.
+Windows access controls depend on the parent directory's ACLs.
+
 ## Tests
 
 The default suite is offline and free: every provider SDK is replaced by a fake,
@@ -342,8 +359,7 @@ so no network access or API calls are needed. Run the agent and streaming tests
 alongside the installer tests:
 
 ```console
-python3 -m unittest tests.test_pieni tests.test_streaming tests.test_controls
-python3 -m unittest tests.test_install  # installer, against temporary copies
+python3 -m unittest discover  # includes installer tests against temporary copies
 ```
 
 `test_install.py` (22 tests) copies the checkout into a temporary directory, runs

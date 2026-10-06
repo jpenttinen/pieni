@@ -15,7 +15,9 @@ import importlib
 import json
 import os
 import re
+import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -159,6 +161,7 @@ class Reply:
     estimated: bool
     thinking: str = ""  # the display trace; replay data is kept separately
     provider_reasoning: dict = None  # complete fields required for continuation
+    responses_output: list = None  # native output sequence, including opaque reasoning
 
 
 @dataclass
@@ -243,8 +246,14 @@ def load_config(cli_provider=None, cli_model=None, cli_permissions=None,
     """Merge built-in defaults, then the INI files, then CLI arguments."""
     values = {"provider": None, "model": None, "permissions": DEFAULT_PERMISSIONS,
               "streaming": DEFAULT_STREAMING, "reasoning": "default"}
-    for path in config_paths(cwd or os.getcwd(), home):
+    for index, path in enumerate(config_paths(cwd or os.getcwd(), home)):
         for key, value in read_config_file(path).items():
+            # A checkout must not choose a new recipient for an exported secret.
+            if (index == 1 and key == "provider" and not cli_provider
+                    and re.match(r"^https?://", value, re.IGNORECASE)
+                    and value != values["provider"]):
+                raise ConfigError(f"{path}: select this custom provider explicitly on the CLI "
+                                  "or configure it in ~/.pieni/pieni.ini")
             if key == "permissions":
                 value = check_permissions(value, str(path))
             if key == "reasoning":
@@ -308,6 +317,8 @@ def truncate(text, limit=MAX_OUTPUT_CHARS):
 def short(value, limit=60):
     """One-line, bounded rendering of a tool argument for the status line."""
     text = json.dumps(value, ensure_ascii=False) if isinstance(value, str) else repr(value)
+    # Invalid model strings must remain printable when a tool rejects them.
+    text = text.encode("utf-8", errors="backslashreplace").decode("utf-8")
     text = " ".join(text.split())
     return text if len(text) <= limit else f"{text[:limit]}..."
 
@@ -499,7 +510,7 @@ class Toolbox:
             return handler(resolved=resolved, **arguments)
         except PieniError as exc:
             return ToolOutcome(False, str(exc), f"error: {exc}")
-        except (OSError, UnicodeDecodeError, subprocess.SubprocessError) as exc:
+        except (OSError, UnicodeError, subprocess.SubprocessError) as exc:
             return ToolOutcome(False, type(exc).__name__, f"error: {exc}")
 
     # -- argument validation ------------------------------------------------
@@ -519,6 +530,13 @@ class Toolbox:
                     raise PieniError(f"argument '{key}' must be an integer")
             elif not isinstance(value, str):
                 raise PieniError(f"argument '{key}' must be a string")
+            else:
+                if key in ("path", "command") and "\0" in value:
+                    raise PieniError(f"argument '{key}' must not contain NUL")
+                try:
+                    value.encode("utf-8")  # reject before opening/truncating files
+                except UnicodeEncodeError as exc:
+                    raise PieniError(f"argument '{key}' must be valid UTF-8 text") from exc
             if key in ("path", "command", "old_text") and not value:
                 raise PieniError(f"argument '{key}' must not be empty")
 
@@ -566,19 +584,33 @@ class Toolbox:
         allowed, reason = self.permissions.check_shell(command)
         if not allowed:
             return ToolOutcome(False, "denied", f"error: {reason}")
-        try:
-            completed = subprocess.run(
-                command, shell=True, cwd=self.workspace, capture_output=True,
-                text=True, errors="replace", timeout=timeout,
-            )
-        except subprocess.TimeoutExpired:
-            return ToolOutcome(False, f"timeout after {timeout}s",
-                               f"error: the command did not finish within {timeout} seconds")
-        output = (completed.stdout or "") + (completed.stderr or "")
-        if completed.returncode == 0:
+        with subprocess.Popen(
+            command, shell=True, cwd=self.workspace, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, errors="replace",
+            start_new_session=os.name == "posix",
+        ) as process:
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+            except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
+                # Kill the shell's ordinary descendants too; detached sessions
+                # remain outside this best-effort cleanup, not an OS sandbox.
+                if os.name == "posix":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass  # the process group has already exited
+                else:
+                    process.kill()
+                process.wait()  # reap the immediate child without draining pipes
+                if isinstance(exc, KeyboardInterrupt):
+                    raise
+                return ToolOutcome(False, f"timeout after {timeout}s",
+                                   f"error: the command did not finish within {timeout} seconds")
+        output = (stdout or "") + (stderr or "")
+        if process.returncode == 0:
             return ToolOutcome(True, "", truncate(output or "(no output)"))
-        body = f"exit code {completed.returncode}\n{output or '(no output)'}"
-        return ToolOutcome(False, f"exit code {completed.returncode}", truncate(body))
+        body = f"exit code {process.returncode}\n{output or '(no output)'}"
+        return ToolOutcome(False, f"exit code {process.returncode}", truncate(body))
 
 
 def parse_tool_arguments(raw):
@@ -604,6 +636,8 @@ def assistant_message(reply):
     message = {"role": "assistant", "content": reply.text}
     if reply.provider_reasoning:
         message.update(reply.provider_reasoning)
+    if reply.responses_output is not None:
+        message["responses_output"] = reply.responses_output
     if reply.tool_calls:
         message["tool_calls"] = [{"id": call.id, "name": call.name,
                                   "arguments": call.arguments} for call in reply.tool_calls]
@@ -660,6 +694,10 @@ def to_responses_input(messages):
                           "call_id": message["tool_call_id"],
                           "output": message.get("content", "")})
         elif role == "assistant":
+            if "responses_output" in message:
+                # Replay every native item in order, rather than duplicating text/calls.
+                items.extend(message["responses_output"])
+                continue
             if message.get("content"):
                 items.append({"role": "assistant", "content": message["content"]})
             for call in message.get("tool_calls") or []:
@@ -675,6 +713,16 @@ def attribute(obj, name, default=None):
     if isinstance(obj, dict):
         return obj.get(name, default)
     return getattr(obj, name, default)
+
+
+def serialize_responses_output(items):
+    """Save SDK output as JSON without losing fields or their original order."""
+    def encode(item):
+        if hasattr(item, "model_dump"):
+            return item.model_dump(mode="json", by_alias=True)
+        return vars(item)  # lightweight objects used by offline SDK fakes
+
+    return json.loads(json.dumps(items, ensure_ascii=False, default=encode))
 
 
 def usage_pair(usage, input_name, output_name):
@@ -733,6 +781,11 @@ def chat_reasoning(message, kind):
             if attribute(message, key) is not None}
 
 
+def check_chat_finish(reason):
+    if reason is not None and reason not in ("stop", "tool_calls", "function_call"):
+        raise ProviderError(f"reply stopped with finish reason '{reason}'")
+
+
 def collect_chat_stream(stream, on_text=None, kind="custom"):
     """Assemble indexed tool fragments; never execute a partially received call."""
     text, thinking, calls = [], [], {}
@@ -749,8 +802,7 @@ def collect_chat_stream(stream, on_text=None, kind="custom"):
                     continue
                 reason = attribute(choice, "finish_reason")
                 if reason is not None:
-                    if reason not in ("stop", "tool_calls", "function_call"):
-                        raise ProviderError(f"stream stopped with finish reason '{reason}'")
+                    check_chat_finish(reason)
                     finished = True
                 delta = attribute(choice, "delta")
                 content = attribute(delta, "content") or ""
@@ -843,6 +895,7 @@ def call_chat(send, model, messages, tools, streaming, on_text, include_usage=Fa
     choices = attribute(response, "choices") or []
     if not choices:
         raise ProviderError("the provider returned no choices")
+    check_chat_finish(attribute(choices[0], "finish_reason"))
     message = attribute(choices[0], "message")
     text = attribute(message, "content") or ""
     calls = [ToolCall(attribute(call, "id"), attribute(attribute(call, "function"), "name"),
@@ -883,6 +936,12 @@ def call_responses(client, model, messages, tools, streaming=DEFAULT_STREAMING,
     response = client.responses.create(**request)
     if streaming:
         response = collect_responses_stream(response, on_text)
+    status = attribute(response, "status")
+    error = attribute(response, "error")
+    if error or status not in (None, "completed"):
+        detail = (attribute(error, "message") or
+                  attribute(attribute(response, "incomplete_details"), "reason") or status)
+        raise ProviderError(f"reply failed: {detail}")
     text = attribute(response, "output_text") or ""
     items = attribute(response, "output") or []
     calls = []
@@ -894,7 +953,9 @@ def call_responses(client, model, messages, tools, streaming=DEFAULT_STREAMING,
         raise ProviderError("the provider returned neither text nor tool calls")
     tokens = usage_pair(attribute(response, "usage"), "input_tokens", "output_tokens")
     thinking = [reasoning_text(item) for item in items if attribute(item, "type") == "reasoning"]
-    return make_reply(text, calls, "\n".join(part for part in thinking if part), tokens, wire, tools)
+    reply = make_reply(text, calls, "\n".join(part for part in thinking if part), tokens, wire, tools)
+    reply.responses_output = serialize_responses_output(items)
+    return reply
 
 
 def load_sdk(module_name, attribute_name):
@@ -968,8 +1029,8 @@ def build_provider(provider_name, model, environment=None, streaming=DEFAULT_STR
         if kind == "chat":
             options = {"api_key": environment[key_name], "base_url": DEEPSEEK_BASE_URL}
         elif kind == "custom":
-            # Local servers often need no key; the SDK still requires a placeholder.
-            options = {"api_key": environment.get("OPENAI_API_KEY") or "not-needed",
+            # Never forward an OpenAI credential to an unrelated custom endpoint.
+            options = {"api_key": environment.get("PIENI_CUSTOM_API_KEY") or "not-needed",
                        "base_url": provider_name}
         client = OpenAI(**options)
         return Provider(provider_name, model, kind, client, close=getattr(client, "close", None),
@@ -1001,13 +1062,40 @@ CREATE TABLE IF NOT EXISTS messages (
 """
 
 
+def private_database_file(path, create=False):
+    """Tighten only a regular, unlinked database file, without following symlinks."""
+    if path.is_symlink():
+        raise OSError("conversation database and sidecars must not be symbolic links")
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, flags | (os.O_CREAT if create else 0), 0o600)
+    try:
+        info = os.fstat(descriptor)
+        # A hardlink would change another file's permissions; special files can hang SQLite.
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError("conversation database and sidecars must be regular files with one link")
+        if os.name == "posix":
+            os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+
+
 class Store:
     """SQLite persistence for sessions, message logs, and the active context."""
 
     def __init__(self, path):
         self.path = Path(path)
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # Private app storage protects prompts and tool output, which can contain secrets.
+            if self.path.parent.is_symlink():
+                raise OSError("conversation storage directory must not be a symbolic link")
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if self.path.parent.name == APP_DIR:
+                self.path.parent.chmod(0o700)  # also tighten existing app-owned storage
+            private_database_file(self.path, create=True)
+            for suffix in ("-journal", "-wal", "-shm"):
+                sidecar = Path(str(self.path) + suffix)
+                if sidecar.exists() or sidecar.is_symlink():
+                    private_database_file(sidecar)
             self.connection = sqlite3.connect(self.path)
             self.connection.row_factory = sqlite3.Row
             self.connection.executescript(SCHEMA)
@@ -1062,8 +1150,15 @@ class Store:
             with self.connection:
                 self.deactivate(session_id, boundary, commit=False)
                 self.add_message(session_id, message, commit=False)
-        except sqlite3.Error as exc:
-            raise PieniError(f"database error: {exc}") from exc
+        except BaseException as exc:
+            # Older Python versions leave a failed commit pending; never replay it later.
+            try:
+                self.connection.rollback()
+            except sqlite3.Error as rollback_error:
+                raise PieniError(f"database rollback failed: {rollback_error}") from exc
+            if isinstance(exc, sqlite3.Error):
+                raise PieniError(f"database error: {exc}") from exc
+            raise
 
     def close(self):
         try:
@@ -1093,7 +1188,8 @@ def compaction_history(messages):
     """Serialize a shortened copy as data, never as native tool calls."""
     history = []
     for message in messages:
-        entry = {key: value for key, value in message.items() if key not in REASONING_FIELDS}
+        entry = {key: value for key, value in message.items()
+                 if key not in REASONING_FIELDS and key != "responses_output"}
         if message["role"] == "tool":
             entry["content"] = compact_text(message.get("content", ""))
         if message.get("tool_calls"):

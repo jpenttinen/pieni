@@ -121,19 +121,18 @@ fi
 
 dependencies="not checked (--skip-deps)"
 if [ "$skip_deps" -eq 0 ]; then
-    deps_python=""
-    for candidate in "$repo/.venv/bin/python" "$(command -v "$python" 2>/dev/null || true)"; do
-        [ -n "$candidate" ] && [ -x "$candidate" ] || continue
-        if "$candidate" -c 'import openai, openrouter' >/dev/null 2>&1; then
-            deps_python="$candidate"
-            break
-        fi
-    done
-    if [ -n "$deps_python" ]; then
+    venv="$repo/.venv"
+    # Match the launcher: an existing virtualenv takes precedence over python3.
+    # PYTHON selects the interpreter for creating a venv, not the fallback launcher.
+    if [ -x "$venv/bin/python" ]; then
+        deps_python="$venv/bin/python"
+    else
+        deps_python="$(command -v python3 2>/dev/null || true)"
+    fi
+    if [ -n "$deps_python" ] && "$deps_python" -c 'import openai, openrouter' >/dev/null 2>&1; then
         dependencies="already available with $deps_python"
         say "deps:     $dependencies"
     else
-        venv="$repo/.venv"
         say "deps:     missing; installing openai and openrouter into $venv"
         if [ ! -x "$venv/bin/python" ]; then
             do_it "$python" -m venv "$venv" \

@@ -509,7 +509,7 @@ class BuildProviderTests(unittest.TestCase):
                          {"api_key": "not-needed", "base_url": "http://localhost:30000"})
 
     def test_custom_base_url_uses_the_key_when_given(self):
-        pieni.build_provider("http://localhost:30000", "qwen", {"OPENAI_API_KEY": "k"})
+        pieni.build_provider("http://localhost:30000", "qwen", {"PIENI_CUSTOM_API_KEY": "k"})
         self.assertEqual(FakeOpenAI.instances[-1].kwargs.get("api_key"), "k")
 
     def test_openai_sdk_clients_close_once(self):

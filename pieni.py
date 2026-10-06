@@ -1071,14 +1071,17 @@ CREATE TABLE IF NOT EXISTS messages (
 def private_database_file(path, create=False):
     """Make a regular file with one link private, without following symlinks."""
     if path.is_symlink():
-        raise OSError("conversation database and sidecars must not be symbolic links")
+        raise OSError(f"{path}: conversation database and sidecars must not be symbolic links")
     flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     descriptor = os.open(path, flags | (os.O_CREAT if create else 0), 0o600)
     try:
         info = os.fstat(descriptor)
         # A hardlink would change another file's permissions; special files can hang SQLite.
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            raise OSError("conversation database and sidecars must be regular files with one link")
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"{path}: conversation database and sidecars must be regular files")
+        if info.st_nlink != 1:
+            raise OSError(f"{path}: expected one file link, found {info.st_nlink}; "
+                          "use an independent private copy")
         if os.name == "posix":
             os.fchmod(descriptor, 0o600)
     finally:

@@ -109,8 +109,9 @@ class PrivateStorageTests(TempWorkspaceCase):
                 if linked.exists():
                     linked.unlink()
                 os.link(target, linked)
-                with self.assertRaisesRegex(pieni.PieniError, "regular files with one link"):
+                with self.assertRaisesRegex(pieni.PieniError, "expected one file link, found 2") as caught:
                     pieni.Store(directory / "pieni.db")
+                self.assertIn(str(linked), str(caught.exception))
                 self.assertEqual(target.read_bytes(), b"sentinel")
                 self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
                 linked.unlink()
@@ -125,7 +126,8 @@ class PrivateStorageTests(TempWorkspaceCase):
                 if path.exists():
                     path.unlink()
                 os.mkfifo(path, mode=0o644)
-                with self.assertRaisesRegex(pieni.PieniError, "regular files with one link"):
+                with self.assertRaisesRegex(pieni.PieniError, "must be regular files") as caught:
                     pieni.Store(directory / "pieni.db")
+                self.assertIn(str(path), str(caught.exception))
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
                 path.unlink()

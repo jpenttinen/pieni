@@ -662,23 +662,20 @@ def to_chat_messages(messages):
         if role == "tool":
             wire.append({"role": "tool", "tool_call_id": message["tool_call_id"],
                          "content": message.get("content", "")})
-        elif role == "assistant":
+            continue
+        entry = {"role": role, "content": message.get("content", "")}
+        if role == "assistant":
             calls = message.get("tool_calls") or []
             # Tool-call messages carry no text; null content is the usual wire form.
-            entry = {"role": "assistant",
-                     "content": message.get("content") or (None if calls else "")}
-            for key in REASONING_FIELDS:
-                if key in message:
-                    entry[key] = message[key]
+            entry["content"] = entry["content"] or (None if calls else "")
+            entry.update({key: message[key] for key in REASONING_FIELDS if key in message})
             if calls:
                 entry["tool_calls"] = [
                     {"id": call["id"], "type": "function",
                      "function": {"name": call["name"], "arguments": call["arguments"]}}
                     for call in calls
                 ]
-            wire.append(entry)
-        else:
-            wire.append({"role": role, "content": message.get("content", "")})
+        wire.append(entry)
     return wire
 
 
@@ -693,11 +690,10 @@ def to_responses_input(messages):
             items.append({"type": "function_call_output",
                           "call_id": message["tool_call_id"],
                           "output": message.get("content", "")})
+        elif role == "assistant" and "responses_output" in message:
+            # Replay every native item in order, rather than duplicating text/calls.
+            items.extend(message["responses_output"])
         elif role == "assistant":
-            if "responses_output" in message:
-                # Replay every native item in order, rather than duplicating text/calls.
-                items.extend(message["responses_output"])
-                continue
             if message.get("content"):
                 items.append({"role": "assistant", "content": message["content"]})
             for call in message.get("tool_calls") or []:
@@ -727,8 +723,6 @@ def serialize_responses_output(items):
 
 def usage_pair(usage, input_name, output_name):
     """(input, output) tokens from a provider usage object, or None when absent."""
-    if usage is None:
-        return None
     inputs = attribute(usage, input_name)
     outputs = attribute(usage, output_name)
     if inputs is None or outputs is None:
@@ -777,8 +771,7 @@ def chat_reasoning(message, kind):
         return {}
     if hasattr(message, "model_dump"):
         message = message.model_dump(mode="json", by_alias=True)
-    return {key: attribute(message, key) for key in keys
-            if attribute(message, key) is not None}
+    return {key: value for key in keys if (value := attribute(message, key)) is not None}
 
 
 def check_chat_finish(reason):
@@ -786,12 +779,36 @@ def check_chat_finish(reason):
         raise ProviderError(f"reply stopped with finish reason '{reason}'")
 
 
+@contextlib.contextmanager
+def closing_stream(stream):
+    """Some SDK stream wrappers do not expose close(); close those that do."""
+    try:
+        yield
+    finally:
+        close = getattr(stream, "close", None)
+        if close:
+            close()
+
+
+def append_tool_fragment(calls, fragment):
+    """Accumulate one indexed Chat Completions tool call without losing order."""
+    index = attribute(fragment, "index")
+    if not isinstance(index, int) or index < 0:
+        raise ProviderError("stream tool call has no valid index")
+    call = calls.setdefault(index, {"id": "", "type": "function",
+                                   "function": {"name": "", "arguments": ""}})
+    call["id"] += attribute(fragment, "id") or ""
+    function = attribute(fragment, "function")
+    for field in ("name", "arguments"):
+        call["function"][field] += attribute(function, field) or ""
+
+
 def collect_chat_stream(stream, on_text=None, kind="custom"):
     """Assemble indexed tool fragments; never execute a partially received call."""
     text, thinking, calls = [], [], {}
     replay = {}
     usage, finished = None, False
-    try:
+    with closing_stream(stream):
         for event in stream:
             if attribute(event, "error"):
                 raise ProviderError(f"stream error: {attribute(event, 'error')}")
@@ -818,15 +835,7 @@ def collect_chat_stream(stream, on_text=None, kind="custom"):
                     else:
                         replay[key] = replay.get(key, "") + value
                 for fragment in attribute(delta, "tool_calls") or []:
-                    index = attribute(fragment, "index")
-                    if not isinstance(index, int) or index < 0:
-                        raise ProviderError("stream tool call has no valid index")
-                    call = calls.setdefault(index, {"id": "", "type": "function",
-                                                   "function": {"name": "", "arguments": ""}})
-                    call["id"] += attribute(fragment, "id") or ""
-                    function = attribute(fragment, "function")
-                    for field in ("name", "arguments"):
-                        call["function"][field] += attribute(function, field) or ""
+                    append_tool_fragment(calls, fragment)
         if not finished:
             raise ProviderError("stream ended before the reply finished")
         for call in calls.values():
@@ -836,16 +845,12 @@ def collect_chat_stream(stream, on_text=None, kind="custom"):
                 "reasoning_content": "".join(thinking),
                 **replay,
                 "tool_calls": [calls[index] for index in sorted(calls)]}}], "usage": usage}
-    finally:
-        close = getattr(stream, "close", None)
-        if close:
-            close()
 
 
 def collect_responses_stream(stream, on_text=None):
     """The completed Response holds full tool arguments, text, and usage."""
     response = None
-    try:
+    with closing_stream(stream):
         for event in stream:
             kind = attribute(event, "type")
             if kind == "response.output_text.delta" and on_text:
@@ -857,10 +862,10 @@ def collect_responses_stream(stream, on_text=None):
         if response is None:
             raise ProviderError("stream ended before the reply finished")
         return response
-    finally:
-        close = getattr(stream, "close", None)
-        if close:
-            close()
+
+
+def tool_call(call_id, function):
+    return ToolCall(call_id, attribute(function, "name"), attribute(function, "arguments") or "{}")
 
 
 def make_reply(text, calls, thinking, tokens, wire, tools):
@@ -898,8 +903,7 @@ def call_chat(send, model, messages, tools, streaming, on_text, include_usage=Fa
     check_chat_finish(attribute(choices[0], "finish_reason"))
     message = attribute(choices[0], "message")
     text = attribute(message, "content") or ""
-    calls = [ToolCall(attribute(call, "id"), attribute(attribute(call, "function"), "name"),
-                      attribute(attribute(call, "function"), "arguments") or "{}")
+    calls = [tool_call(attribute(call, "id"), attribute(call, "function"))
              for call in attribute(message, "tool_calls") or []]
     tokens = usage_pair(attribute(response, "usage"), "prompt_tokens", "completion_tokens")
     reply = make_reply(text, calls, thinking_from_message(message), tokens, wire, tools)
@@ -944,11 +948,8 @@ def call_responses(client, model, messages, tools, streaming=DEFAULT_STREAMING,
         raise ProviderError(f"reply failed: {detail}")
     text = attribute(response, "output_text") or ""
     items = attribute(response, "output") or []
-    calls = []
-    for item in items:
-        if attribute(item, "type") == "function_call":
-            calls.append(ToolCall(attribute(item, "call_id"), attribute(item, "name"),
-                                  attribute(item, "arguments") or "{}"))
+    calls = [tool_call(attribute(item, "call_id"), item) for item in items
+             if attribute(item, "type") == "function_call"]
     if not text and not calls:
         raise ProviderError("the provider returned neither text nor tool calls")
     tokens = usage_pair(attribute(response, "usage"), "input_tokens", "output_tokens")
@@ -1016,24 +1017,21 @@ def build_provider(provider_name, model, environment=None, streaming=DEFAULT_STR
             raise ConfigError(f"{provider_name} needs the {key_name} environment variable")
         if kind == "openrouter":
             OpenRouter = load_sdk("openrouter", "OpenRouter")
-            stack = contextlib.ExitStack()
-            try:
+            with contextlib.ExitStack() as stack:
                 client = stack.enter_context(OpenRouter(api_key=environment["OPENROUTER_API_KEY"]))
-            except Exception:
-                stack.close()
-                raise
-            return Provider(provider_name, model, kind, client, close=stack.close,
-                            streaming=streaming, reasoning=reasoning)
-        OpenAI = load_sdk("openai", "OpenAI")
-        options = {}
-        if kind == "chat":
-            options = {"api_key": environment[key_name], "base_url": DEEPSEEK_BASE_URL}
-        elif kind == "custom":
-            # Never forward an OpenAI credential to an unrelated custom endpoint.
-            options = {"api_key": environment.get("PIENI_CUSTOM_API_KEY") or "not-needed",
-                       "base_url": provider_name}
-        client = OpenAI(**options)
-        return Provider(provider_name, model, kind, client, close=getattr(client, "close", None),
+                close = stack.pop_all().close
+        else:
+            OpenAI = load_sdk("openai", "OpenAI")
+            options = {}
+            if kind == "chat":
+                options = {"api_key": environment[key_name], "base_url": DEEPSEEK_BASE_URL}
+            elif kind == "custom":
+                # Never forward an OpenAI credential to an unrelated custom endpoint.
+                options = {"api_key": environment.get("PIENI_CUSTOM_API_KEY") or "not-needed",
+                           "base_url": provider_name}
+            client = OpenAI(**options)
+            close = getattr(client, "close", None)
+        return Provider(provider_name, model, kind, client, close=close,
                         streaming=streaming, reasoning=reasoning)
     except PieniError:
         raise

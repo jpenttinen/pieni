@@ -1093,6 +1093,7 @@ class Store:
 
     def __init__(self, path):
         self.path = Path(path)
+        connection = None
         try:
             # Private app storage protects prompts and tool output, which can contain secrets.
             if self.path.parent.is_symlink():
@@ -1105,12 +1106,17 @@ class Store:
                 sidecar = Path(str(self.path) + suffix)
                 if sidecar.exists() or sidecar.is_symlink():
                     private_database_file(sidecar)
-            self.connection = sqlite3.connect(self.path)
+            self.connection = connection = sqlite3.connect(self.path)
             self.connection.row_factory = sqlite3.Row
             self.connection.executescript(SCHEMA)
             self.connection.commit()
-        except (OSError, sqlite3.Error) as exc:
-            raise PieniError(f"cannot open the database {self.path}: {exc}") from exc
+        except BaseException as exc:
+            if connection is not None:
+                with contextlib.suppress(sqlite3.Error):
+                    connection.close()
+            if isinstance(exc, (OSError, sqlite3.Error)):
+                raise PieniError(f"cannot open the database {self.path}: {exc}") from exc
+            raise
 
     def execute(self, sql, parameters=(), commit=False):
         try:
@@ -1118,8 +1124,19 @@ class Store:
             if commit:
                 self.connection.commit()
             return cursor
+        except BaseException as exc:
+            if commit:
+                self._rollback(exc)
+            if isinstance(exc, sqlite3.Error):
+                raise PieniError(f"database error: {exc}") from exc
+            raise
+
+    def _rollback(self, cause):
+        """Clear failed writes before another operation can commit them."""
+        try:
+            self.connection.rollback()
         except sqlite3.Error as exc:
-            raise PieniError(f"database error: {exc}") from exc
+            raise PieniError(f"database rollback failed: {exc}") from cause
 
     def resume(self, provider, model, workspace):
         """Latest session for this provider, model, and workspace plus its active context."""
@@ -1161,10 +1178,7 @@ class Store:
                 self.add_message(session_id, message, commit=False)
         except BaseException as exc:
             # Older Python versions leave a failed commit pending; never replay it later.
-            try:
-                self.connection.rollback()
-            except sqlite3.Error as rollback_error:
-                raise PieniError(f"database rollback failed: {rollback_error}") from exc
+            self._rollback(exc)
             if isinstance(exc, sqlite3.Error):
                 raise PieniError(f"database error: {exc}") from exc
             raise
@@ -1243,8 +1257,9 @@ class Agent:
         return [{"role": "system", "content": self.instructions}] + self.messages
 
     def remember(self, message):
+        message_id = self.store.add_message(self.session_id, message, active=True)
         self.messages.append(message)
-        return self.store.add_message(self.session_id, message, active=True)
+        return message_id
 
     def context_tokens(self):
         """Rough size of the active context: instructions, tools, and messages."""
@@ -1292,8 +1307,8 @@ class Agent:
         """Run one task; always prints the usage summary. True when an answer was produced."""
         usage = TaskUsage()
         started = time.monotonic()
-        self.remember({"role": "user", "content": prompt})
         try:
+            self.remember({"role": "user", "content": prompt})
             return self.steps(usage)
         except ProviderError as exc:
             self.out(f"error: {exc}")
@@ -1535,8 +1550,9 @@ def run_prompt(provider, prompt):
 
 
 def run_agent(arguments):
-    if arguments.prompt is not None and not arguments.prompt.strip():
-        raise ConfigError("-p/--prompt needs a non-empty prompt")
+    for option, prompt in (("-p/--prompt", arguments.prompt), ("-r/--run", arguments.run)):
+        if prompt is not None and not prompt.strip():
+            raise ConfigError(f"{option} needs a non-empty prompt")
     settings = load_config(arguments.provider, arguments.model, arguments.permissions,
                            cli_streaming=arguments.streaming, cli_reasoning=arguments.reasoning)
     provider_name = settings["provider"]
@@ -1570,8 +1586,6 @@ def run_agent(arguments):
                           messages, workspace, permissions)
             if interactive:
                 return run_interactive(agent)
-            if not arguments.run.strip():
-                raise ConfigError("-r/--run needs a non-empty prompt")
             return 0 if agent.run_task(arguments.run) else 1
 
 

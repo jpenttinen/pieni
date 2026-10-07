@@ -1852,13 +1852,18 @@ class CliTests(TempWorkspaceCase):
         self.assertIn("OPENAI_API_KEY", stderr.getvalue())
 
     def test_empty_headless_prompt_is_rejected(self):
-        stderr = StringIO()
-        with self.isolate_config(), redirect_stderr(stderr), redirect_stdout(StringIO()):
-            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "k"}):
-                with mock.patch.dict(sys.modules, {"openai": SimpleNamespace(OpenAI=ScriptedFakeOpenAI)}):
-                    code = pieni.main(["openai", "-m", "gpt-x", "-r", "   "])
-        self.assertEqual(code, 2)
-        self.assertIn("non-empty prompt", stderr.getvalue())
+        ScriptedFakeOpenAI.instances = []
+        for prompt in ("", " \n\t"):
+            stderr = StringIO()
+            with self.subTest(prompt=prompt), self.isolate_config():
+                with redirect_stderr(stderr), redirect_stdout(StringIO()):
+                    with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "k"}):
+                        with mock.patch.dict(sys.modules, {"openai": SimpleNamespace(OpenAI=ScriptedFakeOpenAI)}):
+                            code = pieni.main(["openai", "-m", "gpt-x", "-r", prompt])
+                self.assertEqual(code, 2)
+                self.assertIn("-r/--run needs a non-empty prompt", stderr.getvalue())
+                self.assertEqual(ScriptedFakeOpenAI.instances, [])
+                self.assertFalse((self.workspace / pieni.DB_PATH).exists())
 
     def test_headless_run_and_resume(self):
         ScriptedFakeOpenAI.script = [

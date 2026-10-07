@@ -3,12 +3,84 @@ import os
 import sqlite3
 import stat
 import unittest
+from unittest import mock
 
 import pieni
 from tests.test_pieni import TempWorkspaceCase
 
 
 class ContextRollbackTests(TempWorkspaceCase):
+    def test_failed_message_commit_is_not_replayed_by_the_next_write(self):
+        store = pieni.Store(self.workspace / pieni.DB_PATH)
+        self.addCleanup(store.close)
+        session = store.start_session("fake", "m", str(self.workspace))
+        store.execute("PRAGMA busy_timeout=0")
+        reader = sqlite3.connect(store.path)
+        try:
+            reader.execute("BEGIN")
+            reader.execute("SELECT payload FROM messages").fetchall()
+            with self.assertRaisesRegex(pieni.PieniError, "database is locked"):
+                store.add_message(session, {"role": "user", "content": "failed write"})
+            self.assertFalse(store.connection.in_transaction)
+        finally:
+            reader.close()
+        next_message = {"role": "user", "content": "next write"}
+        store.add_message(session, next_message)
+        self.assertEqual(store.resume("fake", "m", str(self.workspace))[1], [next_message])
+
+    def test_interrupted_message_commit_is_rolled_back_before_next_write(self):
+        class InterruptOnce(sqlite3.Connection):
+            def commit(self):
+                if self.interrupt:
+                    self.interrupt = False
+                    raise KeyboardInterrupt
+                super().commit()
+
+        store = pieni.Store(self.workspace / pieni.DB_PATH)
+        self.addCleanup(store.close)
+        session = store.start_session("fake", "m", str(self.workspace))
+        store.connection.close()
+        store.connection = sqlite3.connect(store.path, factory=InterruptOnce)
+        store.connection.row_factory = sqlite3.Row
+        store.connection.interrupt = True
+        with self.assertRaises(KeyboardInterrupt):
+            store.add_message(session, {"role": "user", "content": "interrupted write"})
+        self.assertFalse(store.connection.in_transaction)
+        next_message = {"role": "user", "content": "next write"}
+        store.add_message(session, next_message)
+        self.assertEqual(store.resume("fake", "m", str(self.workspace))[1], [next_message])
+
+    def test_failed_message_save_does_not_extend_the_active_context(self):
+        agent, _, store, _ = self.make_agent([])
+        before = list(agent.messages)
+        with mock.patch.object(store, "add_message", side_effect=pieni.PieniError("disk full")):
+            with self.assertRaisesRegex(pieni.PieniError, "disk full"):
+                agent.remember({"role": "user", "content": "not saved"})
+        self.assertEqual(agent.messages, before)
+
+    def test_failed_initial_save_still_reports_task_usage_and_handles_interrupt(self):
+        for error in (pieni.PieniError("disk full"), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__):
+                agent, provider, store, output = self.make_agent([])
+                with mock.patch.object(store, "add_message", side_effect=error):
+                    if isinstance(error, KeyboardInterrupt):
+                        self.assertFalse(agent.run_task("not saved"))
+                        self.assertIn("interrupted", output)
+                    else:
+                        with self.assertRaisesRegex(pieni.PieniError, "disk full"):
+                            agent.run_task("not saved")
+                self.assertEqual(agent.messages, [])
+                self.assertEqual(provider.requests, [])
+                self.assertTrue(output[-1].startswith("Tokens: 0 |"))
+
+    def test_database_initialization_failure_closes_its_connection(self):
+        connection = mock.Mock()
+        connection.executescript.side_effect = sqlite3.OperationalError("disk full")
+        with mock.patch("pieni.sqlite3.connect", return_value=connection):
+            with self.assertRaisesRegex(pieni.PieniError, "cannot open the database.*disk full"):
+                pieni.Store(self.workspace / pieni.DB_PATH)
+        connection.close.assert_called_once_with()
+
     def test_failed_commit_cannot_be_committed_by_next_message(self):
         store = pieni.Store(self.workspace / pieni.DB_PATH)
         self.addCleanup(store.close)

@@ -693,7 +693,9 @@ def to_responses_input(messages):
                           "output": message.get("content", "")})
         elif role == "assistant" and "responses_output" in message:
             # Replay every native item in order, rather than duplicating text/calls.
-            items.extend(message["responses_output"])
+            # SDK dumps add null defaults that the input API may reject (e.g. reasoning status).
+            items.extend({key: value for key, value in item.items() if value is not None}
+                         for item in message["responses_output"])
         elif role == "assistant":
             if message.get("content"):
                 items.append({"role": "assistant", "content": message["content"]})

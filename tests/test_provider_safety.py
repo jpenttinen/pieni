@@ -120,6 +120,23 @@ class ResponsesReplayTests(fixtures.TempWorkspaceCase):
                 self.assertEqual(sum(item.get("type") == "function_call_output"
                                      for item in requests[2]["input"]), 1)
 
+    def test_resumed_native_output_omits_null_sdk_defaults_without_changing_history(self):
+        expected = native_output()
+        legacy = copy.deepcopy(expected)
+        legacy[0].update(status=None, content=None)
+        legacy[1]["phase"] = None
+        expected[1].pop("phase")
+        agent, _, store, _ = self.make_agent([])
+        message = {"role": "assistant", "content": "I will read the file.",
+                   "responses_output": legacy}
+        agent.remember(message)
+        _, saved = store.resume("scripted", "scripted-model", str(self.workspace))
+        client = fixtures.FakeResponsesClient(native_reply([], "done"))
+        pieni.call_responses(client, "m", saved, None, streaming=False)
+        self.assertEqual(client.requests[0]["input"], expected)
+        self.assertEqual(saved[0]["responses_output"], legacy)
+        self.assertEqual(message["responses_output"], legacy)
+
     def test_serializes_sdk_models_with_all_json_fields(self):
         expected = native_output()
         items = [SimpleNamespace(model_dump=mock.Mock(return_value=copy.deepcopy(item)))
@@ -144,7 +161,8 @@ class ResponsesReplayTests(fixtures.TempWorkspaceCase):
         fields = native_output()
         items = [ResponseReasoningItem(**fields[0]), ResponseOutputMessage(**fields[1]),
                  ResponseFunctionToolCall(**fields[2])]
-        expected = [item.model_dump(mode="json", by_alias=True) for item in items]
+        expected = [{key: value for key, value in item.model_dump(mode="json", by_alias=True).items()
+                     if value is not None} for item in items]
         reply = pieni.call_responses(fixtures.FakeResponsesClient(
             native_reply(items, "I will read the file.")), "m", [], None, streaming=False)
         message = json.loads(json.dumps(pieni.assistant_message(reply)))

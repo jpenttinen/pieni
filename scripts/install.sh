@@ -35,6 +35,19 @@ say() { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+logical_link() {
+    local path="$1"
+    local target="$(readlink "$path" 2>/dev/null || true)"
+    if [ -z "$target" ]; then
+        printf '%s\n' "$path"
+        return 0
+    fi
+    case "$target" in
+        /*) printf '%s\n' "$target" ;;
+        *) printf '%s\n' "$(cd "$(dirname "$path")" && pwd -L)/$target" ;;
+    esac
+}
+
 # Run a command, or only describe it when --dry-run is set.
 do_it() {
     if [ "$dry_run" -eq 1 ]; then
@@ -73,14 +86,15 @@ done
 
 # An absolute prefix keeps the symlink and the PATH hint usable from anywhere.
 if [ -d "$prefix" ]; then
-    prefix="$(cd "$prefix" && pwd)"
+    prefix="$(cd "$prefix" && pwd -L)"
 fi
 case "$prefix" in
     /*) ;;
     *) prefix="$PWD/$prefix" ;;
 esac
 
-repo="$(cd "$(dirname "$0")/.." && pwd)"
+repo="$(cd "$(dirname "$0")/.." && pwd -L)"
+export PWD="$repo"
 for file in pieni.sh pieni.py requirements.txt; do
     [ -e "$repo/$file" ] || die "$repo/$file is missing: run this script from a pieni checkout"
 done
@@ -164,10 +178,10 @@ fi
 
 bin_dir="$prefix/bin"
 dest="$bin_dir/pieni"
-if [ -L "$dest" ] && [ "$(readlink -f "$dest")" = "$launcher" ]; then
+if [ -L "$dest" ] && [ "$(logical_link "$dest")" = "$launcher" ]; then
     say "command:  $dest already points here"
 elif [ -L "$dest" ] && [ ! -e "$repo/pieni" ] \
-        && [ "$(readlink -f "$dest")" = "$repo/pieni" ]; then
+        && [ "$(logical_link "$dest")" = "$repo/pieni" ]; then
     # Repair this checkout's installed command after the launcher was renamed.
     do_it ln -sfn "$launcher" "$dest" || die "cannot update the symlink $dest"
     say "command:  $dest -> $launcher"

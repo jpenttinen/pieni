@@ -416,8 +416,26 @@ def dcg_reason(command):
 
 
 def resolve_path(workspace, path):
-    """Resolve a tool path against the workspace, following '..' and symlinks."""
-    return (workspace / Path(path).expanduser()).resolve()
+    """Resolve a tool path against the workspace, following explicit symlinks.
+
+    We normalize parent traversal without canonicalizing the workspace root itself,
+    because macOS exposes /var as a symlink to /private/var and tests expect the
+    original workspace path style to remain stable while still following symlinks
+    explicitly named by the user.
+    """
+    base = Path(os.path.abspath(os.path.expanduser(str(workspace))))
+    target = Path(path).expanduser()
+    if target.is_absolute():
+        current = Path(os.path.abspath(str(target)))
+    else:
+        current = base
+        for part in target.parts:
+            if part in ("", "."):
+                continue
+            current = current / part
+            if current.is_symlink():
+                current = current.resolve(strict=False)
+    return Path(os.path.abspath(os.path.normpath(str(current))))
 
 
 def is_inside(path, root):
@@ -429,8 +447,8 @@ class Permissions:
 
     def __init__(self, mode, workspace, tempdir=None, approve=None):
         self.mode = mode
-        self.workspace = Path(workspace).resolve()
-        self.tempdir = Path(tempdir or tempfile.gettempdir()).resolve()
+        self.workspace = Path(os.path.abspath(os.path.expanduser(str(workspace))))
+        self.tempdir = Path(os.path.abspath(os.path.expanduser(str(tempdir or tempfile.gettempdir()))))
         self.approve = approve  # callable(kind, detail, reason) -> bool, or None
 
     def check_file(self, resolved, action):
@@ -489,7 +507,7 @@ class Toolbox:
     """The four tools, with argument validation, permissions, and output limits."""
 
     def __init__(self, workspace, permissions):
-        self.workspace = Path(workspace).resolve()
+        self.workspace = Path(os.path.abspath(os.path.expanduser(str(workspace))))
         self.permissions = permissions
         self.handlers = {"read": self.read, "write": self.write,
                          "edit": self.edit, "bash": self.bash}
@@ -585,10 +603,13 @@ class Toolbox:
         allowed, reason = self.permissions.check_shell(command)
         if not allowed:
             return ToolOutcome(False, "denied", f"error: {reason}")
+        environment = dict(os.environ)
+        environment["PWD"] = str(self.workspace)
         with subprocess.Popen(
             command, shell=True, cwd=self.workspace, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, errors="replace",
             start_new_session=os.name == "posix",
+            env=environment,
         ) as process:
             try:
                 stdout, stderr = process.communicate(timeout=timeout)
@@ -1243,7 +1264,7 @@ class Agent:
         self.session_id = session_id
         self.instructions = instructions
         self.messages = list(messages)  # conversation only, instructions excluded
-        self.workspace = Path(workspace).resolve()
+        self.workspace = Path(os.path.abspath(os.path.expanduser(str(workspace))))
         self.permissions = permissions
         self.tools = Toolbox(self.workspace, permissions)
         self.out = out

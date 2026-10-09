@@ -107,6 +107,7 @@ class InstallScriptTests(unittest.TestCase):
     def install(self, *arguments, environment=None, path=None, cwd=None):
         env = dict(os.environ)
         env["HOME"] = str(self.root / "home")  # never the real home directory
+        env["PWD"] = str(cwd or self.repo)
         (self.root / "home").mkdir(exist_ok=True)
         if path:
             # Prepend, so the rest of the system tools stay reachable.
@@ -214,10 +215,11 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("Pieni agent v", run.stdout)
 
     def test_relative_prefix_is_made_absolute(self):
+        env = {**os.environ, "HOME": str(self.root / "home"), "PWD": str(self.repo)}
         completed = subprocess.run(
             [BASH, "scripts/install.sh", "--prefix", "local-prefix", "--skip-deps"],
             capture_output=True, text=True, cwd=self.repo, timeout=60,
-            env={**os.environ, "HOME": str(self.root / "home")})
+            env=env)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertTrue((self.repo / "local-prefix" / "bin" / "pieni").is_symlink())
         self.assertIn(f"uninstall:    rm {self.repo}/local-prefix/bin/pieni", completed.stdout)

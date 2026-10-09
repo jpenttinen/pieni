@@ -84,16 +84,19 @@ done
 
 # --- The checkout this script lives in -------------------------------------
 
-# An absolute prefix keeps the symlink and the PATH hint usable from anywhere.
+# Use the logical shell directory across the whole script so /var and /private/var
+# stay consistent on macOS while Linux remains unchanged.
 if [ -d "$prefix" ]; then
-    prefix="$(cd "$prefix" && pwd -L)"
+    cd "$prefix"
+    prefix="$PWD"
 fi
 case "$prefix" in
     /*) ;;
     *) prefix="$PWD/$prefix" ;;
 esac
 
-repo="$(cd "$(dirname "$0")/.." && pwd -L)"
+cd "$(dirname "$0")/.."
+repo="$PWD"
 export PWD="$repo"
 for file in pieni.sh pieni.py requirements.txt; do
     [ -e "$repo/$file" ] || die "$repo/$file is missing: run this script from a pieni checkout"

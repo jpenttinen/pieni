@@ -12,10 +12,14 @@ while [ -L "$launcher" ]; do
     fi
     case "$link" in
         /*) launcher="$link" ;;
-        *) launcher="$(cd "$(dirname "$launcher")" && pwd -L)/$link" ;;
+        *) 
+            cd "$(dirname "$launcher")"
+            launcher="$PWD/$link"
+            ;;
     esac
 done
-here="$(cd "$(dirname "$launcher")" && pwd -L)"
+cd "$(dirname "$launcher")"
+here="$PWD"
 if [ -x "$here/.venv/bin/python" ]; then
     exec "$here/.venv/bin/python" "$here/pieni.py" "$@"
 fi
